@@ -1240,12 +1240,13 @@ HTML_TEMPLATE = '''
                 const data = await res.json();
                 
                 let msg = 'Response Tracking Test:\\n\\n';
-                msg += `Gmail Connected: ${data.gmail_connected ? 'Yes' : 'No'}\\n`;
-                msg += `IMAP Access: ${data.imap_working ? 'Yes' : 'No'}\\n`;
-                msg += `Emails Sent (tracked): ${data.emails_sent || 0}\\n`;
+                msg += `Gmail API Connected: ${data.gmail_connected ? 'Yes' : 'No'}\\n`;
+                msg += `Can Check Inbox: ${data.imap_working ? 'Yes' : 'No'}\\n`;
+                msg += `Emails Sent (from sheet): ${data.emails_sent || 0}\\n`;
                 msg += `Responses Found: ${data.responses_found || 0}\\n`;
                 
                 if (data.error) msg += `\\nError: ${data.error}`;
+                if (data.gmail_api_error) msg += `\\nGmail API Error: ${data.gmail_api_error}`;
                 
                 alert(msg);
             } catch(e) { 
@@ -3630,9 +3631,6 @@ def api_check_responses():
 @app.route('/api/email/test-tracking')
 def api_test_tracking():
     """Test if response tracking is working."""
-    # Reload settings to get latest values
-    current_settings = load_settings()
-    
     result = {
         'gmail_connected': False,
         'imap_working': False,
@@ -3642,46 +3640,62 @@ def api_test_tracking():
     }
     
     try:
-        email_addr = current_settings.get('email', {}).get('email_address', '')
-        password = current_settings.get('email', {}).get('app_password', '')
-        
-        # Debug info
-        result['email_configured'] = bool(email_addr)
-        result['password_configured'] = bool(password) and isinstance(password, str) and len(password) > 5
-        
-        if not email_addr or not password or not isinstance(password, str):
-            result['error'] = f'Email not configured properly. Email: {bool(email_addr)}, Password valid: {isinstance(password, str) and len(str(password)) > 5}'
-            return jsonify(result)
-        
-        result['gmail_connected'] = True
-        
-        # Test IMAP connection
-        import imaplib
-        try:
-            mail = imaplib.IMAP4_SSL('imap.gmail.com')
-            mail.login(email_addr, password)
-            mail.select('inbox')
-            result['imap_working'] = True
+        # Check Gmail API first (works on Railway)
+        if has_gmail_api():
+            result['gmail_connected'] = True
+            result['using_gmail_api'] = True
             
-            # Count recent emails
-            status, messages = mail.search(None, 'ALL')
-            if status == 'OK':
-                result['inbox_count'] = len(messages[0].split())
-            
-            mail.logout()
-        except Exception as e:
-            result['error'] = f'IMAP error: {str(e)}'
-            return jsonify(result)
+            service = get_gmail_service()
+            if service:
+                result['imap_working'] = True  # Gmail API is working
+                
+                # Count emails in inbox
+                try:
+                    results = service.users().messages().list(userId='me', maxResults=10).execute()
+                    result['inbox_count'] = results.get('resultSizeEstimate', 0)
+                except Exception as e:
+                    result['gmail_api_error'] = str(e)
+                
+                # Get response count from cache
+                global cached_responses
+                if 'cached_responses' in globals() and cached_responses:
+                    result['responses_found'] = len(cached_responses)
+            else:
+                result['error'] = 'Gmail API configured but could not connect'
+        else:
+            result['error'] = 'Gmail API not configured. Add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN to Railway.'
+            result['gmail_api_configured'] = False
         
-        # Check sent emails tracker
-        try:
-            from enterprise.responses import get_response_tracker
-            tracker = get_response_tracker()
-            stats = tracker.get_stats()
-            result['emails_sent'] = stats.get('total_sent', 0)
-            result['responses_found'] = stats.get('total_responses', 0)
-        except Exception as e:
-            result['tracker_error'] = str(e)
+        # Get sheet stats for emails sent count
+        sheet = get_sheet()
+        if sheet:
+            try:
+                data = sheet.get_all_values()
+                if len(data) > 1:
+                    headers = [h.lower() for h in data[0]]
+                    
+                    def find_col(keywords):
+                        for i, h in enumerate(headers):
+                            for kw in keywords:
+                                if kw in h:
+                                    return i
+                        return -1
+                    
+                    rc_notes_col = find_col(['rc notes'])
+                    ol_notes_col = find_col(['ol notes'])
+                    
+                    sent_count = 0
+                    for row in data[1:]:
+                        rc_notes = row[rc_notes_col].lower() if rc_notes_col >= 0 and rc_notes_col < len(row) else ''
+                        ol_notes = row[ol_notes_col].lower() if ol_notes_col >= 0 and ol_notes_col < len(row) else ''
+                        if 'sent' in rc_notes:
+                            sent_count += 1
+                        if 'sent' in ol_notes:
+                            sent_count += 1
+                    
+                    result['emails_sent'] = sent_count
+            except Exception as e:
+                result['sheet_error'] = str(e)
         
         return jsonify(result)
     
@@ -5270,31 +5284,21 @@ def api_sheets_credentials():
 @app.route('/api/inbox/test')
 def api_inbox_test():
     """Test inbox connection for response checking."""
-    global settings
     
-    email_settings = settings.get('email', {})
-    email_addr = email_settings.get('email_address')
-    password = email_settings.get('app_password')
-    
-    if not email_addr or not password:
-        return jsonify({'success': False, 'error': 'Email credentials not configured'})
-    
-    try:
-        import imaplib
-        
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(email_addr, password)
-        mail.select('INBOX')
-        
-        # Count recent emails
-        _, messages = mail.search(None, 'ALL')
-        count = len(messages[0].split()) if messages[0] else 0
-        
-        mail.logout()
-        
-        return jsonify({'success': True, 'count': min(count, 100)})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    # Use Gmail API (works on Railway)
+    if has_gmail_api():
+        try:
+            service = get_gmail_service()
+            if service:
+                results = service.users().messages().list(userId='me', maxResults=10).execute()
+                count = results.get('resultSizeEstimate', 0)
+                return jsonify({'success': True, 'count': min(count, 100), 'method': 'Gmail API'})
+            else:
+                return jsonify({'success': False, 'error': 'Could not connect to Gmail API'})
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Gmail API error: {str(e)}'})
+    else:
+        return jsonify({'success': False, 'error': 'Gmail API not configured. Add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.'})
 
 
 @app.route('/api/twitter/send-dm', methods=['POST'])

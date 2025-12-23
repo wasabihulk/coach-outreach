@@ -1,0 +1,40 @@
+# Secrets - NEVER commit these
+credentials.json
+*.json.bak
+.env
+.env.local
+.env.production
+
+# Local settings (may contain secrets)
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local data
+data/reports/*.json
+enterprise/data/*.json
+!enterprise/data/.gitkeep
+
+# Build
+dist/
+build/
+*.egg-info/

@@ -4597,11 +4597,11 @@ def api_email_send():
                     elif stage == 'followup1_sent' and days >= days_between:
                         should_send = True
                         email_type = 'followup_2'
-                    elif stage == 'followup2_sent' and days >= days_between * 3:
-                        # Restart cycle after longer wait
+                    elif stage == 'followup2_sent' and days >= days_between:
+                        # Restart cycle after same wait as other stages
                         should_send = True
                         email_type = 'intro'
-                    
+
                     if should_send:
                         coaches.append({
                             'email': rc_email, 'name': rc_name, 'school': school, 'type': 'rc',
@@ -4637,10 +4637,11 @@ def api_email_send():
                     elif stage == 'followup1_sent' and days >= days_between:
                         should_send = True
                         email_type = 'followup_2'
-                    elif stage == 'followup2_sent' and days >= days_between * 3:
+                    elif stage == 'followup2_sent' and days >= days_between:
+                        # Restart cycle after same wait as other stages
                         should_send = True
                         email_type = 'intro'
-                    
+
                     if should_send:
                         coaches.append({
                             'email': ol_email, 'name': ol_name, 'school': school, 'type': 'ol',

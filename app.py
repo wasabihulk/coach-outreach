@@ -4529,17 +4529,28 @@ def api_email_send():
                     return None
         
         def get_email_stage(contacted_str, notes_str):
-            """Determine what stage the coach is at: 'new', 'intro_sent', 'followup1_sent', 'followup2_sent', 'replied'"""
+            """Determine what stage the coach is at based on MOST RECENT action (first in notes)."""
             contacted = contacted_str.lower() if contacted_str else ''
             notes = notes_str.lower() if notes_str else ''
-            
+
             # Check if coach has responded - skip them!
             if 'replied' in contacted or 'replied' in notes or 'responded' in notes or 'response' in notes:
                 return 'replied'
-            if 'followup 2' in notes or 'follow-up 2' in notes or 'f2' in notes:
-                return 'followup2_sent'
-            if 'followup 1' in notes or 'follow-up 1' in notes or 'f1' in notes:
-                return 'followup1_sent'
+
+            # Look at the FIRST note entry (most recent) to determine stage
+            # Notes format: "Most recent; Older; Oldest" (semicolon separated)
+            if notes:
+                first_note = notes.split(';')[0].strip()
+
+                # Check the most recent action
+                if 'follow-up 2' in first_note or 'followup 2' in first_note or 'f2 sent' in first_note:
+                    return 'followup2_sent'
+                if 'follow-up 1' in first_note or 'followup 1' in first_note or 'f1 sent' in first_note:
+                    return 'followup1_sent'
+                if 'intro sent' in first_note:
+                    return 'intro_sent'
+
+            # Fallback: if contacted but no clear stage in notes, assume intro was sent
             if contacted and parse_date(contacted):
                 return 'intro_sent'
             return 'new'

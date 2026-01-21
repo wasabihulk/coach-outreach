@@ -1,0 +1,31 @@
+# Coach Outreach System v7.3 - Dependencies
+# ============================================================================
+
+# Core dependencies
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Browser automation (optional - for scraping)
+selenium>=4.10.0
+webdriver-manager>=4.0.0
+fake-useragent>=1.2.0
+
+# Google Sheets integration  
+gspread>=5.10.0
+google-auth>=2.22.0
+google-auth-oauthlib>=1.0.0
+
+# Gmail API (for Railway - SMTP blocked)
+google-api-python-client>=2.100.0
+
+# Web framework
+flask>=2.3.0
+flask-cors>=4.0.0
+gunicorn>=21.0.0  # Production server for Railway/Render
+
+# Utilities
+requests>=2.31.0
+python-dotenv>=1.0.0  # Load .env files for local development
+
+# Clipboard (for Twitter DM helper)
+pyperclip>=1.8.0

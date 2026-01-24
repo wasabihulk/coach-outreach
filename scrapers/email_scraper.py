@@ -464,14 +464,20 @@ class EmailScraper:
         self._running = False
     
     def _get_schools_needing_email(self) -> List[Dict]:
-        """Get schools that need email addresses."""
+        """
+        Get schools that need email addresses.
+
+        Includes schools where:
+        - Coach has name but no email
+        - Email Status is 'wrong' (bad email, needs re-scrape)
+        """
         data = self.sheets.get_all_data()
         if len(data) < 2:
             return []
-        
+
         headers = data[0]
         rows = data[1:]
-        
+
         def find_col(keywords):
             for i, h in enumerate(headers):
                 h_lower = h.lower()
@@ -479,32 +485,42 @@ class EmailScraper:
                     if kw in h_lower:
                         return i
             return -1
-        
+
         school_col = find_col(['school'])
         url_col = find_col(['url'])
         ol_name_col = find_col(['oline', 'ol coach'])
         rc_name_col = find_col(['recruiting'])
         ol_email_col = find_col(['oc email', 'ol email'])
         rc_email_col = find_col(['rc email'])
-        
+        # New: Email status columns for re-scraping
+        ol_email_status_col = find_col(['ol email status'])
+        rc_email_status_col = find_col(['rc email status'])
+
         schools = []
-        
+
         for row_idx, row in enumerate(rows):
             row_num = row_idx + 2
-            
+
             school = row[school_col] if school_col >= 0 and school_col < len(row) else ''
             url = row[url_col] if url_col >= 0 and url_col < len(row) else ''
             ol_name = row[ol_name_col] if ol_name_col >= 0 and ol_name_col < len(row) else ''
             rc_name = row[rc_name_col] if rc_name_col >= 0 and rc_name_col < len(row) else ''
             ol_email = row[ol_email_col] if ol_email_col >= 0 and ol_email_col < len(row) else ''
             rc_email = row[rc_email_col] if rc_email_col >= 0 and rc_email_col < len(row) else ''
-            
+            ol_email_status = row[ol_email_status_col] if ol_email_status_col >= 0 and ol_email_status_col < len(row) else ''
+            rc_email_status = row[rc_email_status_col] if rc_email_status_col >= 0 and rc_email_status_col < len(row) else ''
+
             if not url or not url.startswith('http'):
                 continue
-            
-            needs_ol = ol_name and not ol_name.startswith('REVIEW:') and not ol_email
-            needs_rc = rc_name and not rc_name.startswith('REVIEW:') and not rc_email
-            
+
+            # Check if email status is "wrong" (needs re-scrape)
+            ol_email_wrong = ol_email_status.strip().lower() == 'wrong'
+            rc_email_wrong = rc_email_status.strip().lower() == 'wrong'
+
+            # Need to scrape if: no email OR email marked as wrong
+            needs_ol = ol_name and not ol_name.startswith('REVIEW:') and (not ol_email or ol_email_wrong)
+            needs_rc = rc_name and not rc_name.startswith('REVIEW:') and (not rc_email or rc_email_wrong)
+
             if needs_ol or needs_rc:
                 schools.append({
                     'row': row_num,
@@ -514,8 +530,12 @@ class EmailScraper:
                     'rc_name': rc_name if needs_rc else '',
                     'ol_email_col': ol_email_col + 1,
                     'rc_email_col': rc_email_col + 1,
+                    'ol_email_status_col': ol_email_status_col + 1 if ol_email_status_col >= 0 else None,
+                    'rc_email_status_col': rc_email_status_col + 1 if rc_email_status_col >= 0 else None,
+                    'ol_needs_rescrape': ol_email_wrong,
+                    'rc_needs_rescrape': rc_email_wrong,
                 })
-        
+
         return schools
     
     def _process_school(self, school: Dict, callback: Callable):
@@ -563,15 +583,23 @@ class EmailScraper:
                                 school['ol_email_col'],
                                 email
                             )
+                            # Clear "wrong" status if this was a re-scrape
+                            if school.get('ol_needs_rescrape') and school.get('ol_email_status_col'):
+                                self.sheets.update_cell(
+                                    school['row'],
+                                    school['ol_email_status_col'],
+                                    ''  # Clear the "wrong" status
+                                )
                             ol_found = True
                             self.found += 1
                             self._emit(callback, 'found', {
                                 'school': school['name'],
                                 'type': 'OL',
-                                'email': email
+                                'email': email,
+                                'was_rescrape': school.get('ol_needs_rescrape', False)
                             })
                             break
-                
+
                 # Try RC match
                 if school.get('rc_name') and not rc_found:
                     rc_parts = school['rc_name'].lower().split()
@@ -582,12 +610,20 @@ class EmailScraper:
                                 school['rc_email_col'],
                                 email
                             )
+                            # Clear "wrong" status if this was a re-scrape
+                            if school.get('rc_needs_rescrape') and school.get('rc_email_status_col'):
+                                self.sheets.update_cell(
+                                    school['row'],
+                                    school['rc_email_status_col'],
+                                    ''  # Clear the "wrong" status
+                                )
                             rc_found = True
                             self.found += 1
                             self._emit(callback, 'found', {
                                 'school': school['name'],
                                 'type': 'RC',
-                                'email': email
+                                'email': email,
+                                'was_rescrape': school.get('rc_needs_rescrape', False)
                             })
                             break
             

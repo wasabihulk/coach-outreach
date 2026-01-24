@@ -72,49 +72,113 @@ class DMRecord:
 
 class TwitterDMTracker:
     """
-    Tracks sent Twitter DMs to prevent duplicates.
+    Tracks sent Twitter DMs - uses Google Sheets Twitter Status columns.
+    NO LOCAL FILE STORAGE - works on Railway.
     """
-    
+
     def __init__(self, storage_path: str = None):
-        if storage_path is None:
-            storage_path = os.path.expanduser("~/.coach_outreach/twitter_dms.json")
-        self.storage_path = storage_path
+        # NO LOCAL STORAGE - everything via Google Sheets
         self.sent_dms: Dict[str, DMRecord] = {}
         self.daily_count: int = 0
         self.last_reset_date: str = ""
-        self._load()
-    
-    def _load(self):
-        """Load tracking data from disk."""
-        if os.path.exists(self.storage_path):
-            try:
-                with open(self.storage_path, 'r') as f:
-                    data = json.load(f)
-                    self.sent_dms = {
-                        k: DMRecord(**v) for k, v in data.get('sent_dms', {}).items()
-                    }
-                    self.daily_count = data.get('daily_count', 0)
-                    self.last_reset_date = data.get('last_reset_date', '')
-            except Exception as e:
-                logger.error(f"Error loading DM tracker: {e}")
-        
+        self._load_from_sheets()
+
+    def _get_sheet(self):
+        """Get Google Sheets connection."""
+        try:
+            import gspread
+            import os
+            import tempfile
+            from google.oauth2.service_account import Credentials
+
+            google_creds = os.environ.get('GOOGLE_CREDENTIALS', '')
+            if not google_creds:
+                # Try local credentials
+                creds_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'credentials.json')
+                if os.path.exists(creds_file):
+                    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+                    creds = Credentials.from_service_account_file(creds_file, scopes=scope)
+                    client = gspread.authorize(creds)
+                    return client.open('bardeen').sheet1
+                return None
+
+            creds_str = google_creds.strip()
+            if creds_str.startswith('"') and creds_str.endswith('"'):
+                creds_str = creds_str[1:-1]
+            creds_str = creds_str.replace('\\\\n', '\\n')
+
+            temp_creds = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            temp_creds.write(creds_str)
+            temp_creds.close()
+
+            scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_file(temp_creds.name, scopes=scope)
+            client = gspread.authorize(creds)
+            return client.open('bardeen').sheet1
+        except Exception as e:
+            logger.error(f"Sheet connection error: {e}")
+            return None
+
+    def _load_from_sheets(self):
+        """Load DM tracking from Google Sheets Twitter Status columns."""
+        try:
+            sheet = self._get_sheet()
+            if not sheet:
+                return
+
+            all_data = sheet.get_all_values()
+            if len(all_data) < 2:
+                return
+
+            headers = [h.lower().strip() for h in all_data[0]]
+
+            def find_col(keywords):
+                for i, h in enumerate(headers):
+                    for kw in keywords:
+                        if kw in h:
+                            return i
+                return -1
+
+            rc_twitter_status = find_col(['rc twitter status'])
+            ol_twitter_status = find_col(['ol twitter status'])
+            rc_twitter = find_col(['rc twitter'])
+            ol_twitter = find_col(['ol twitter', 'oc twitter'])
+
+            for row in all_data[1:]:
+                # Check RC twitter
+                if rc_twitter >= 0 and rc_twitter_status >= 0:
+                    handle = row[rc_twitter] if rc_twitter < len(row) else ''
+                    status = row[rc_twitter_status] if rc_twitter_status < len(row) else ''
+                    if handle and 'messaged' in status.lower():
+                        self.sent_dms[handle.lower()] = DMRecord(
+                            handle=handle, school='', sent_at=datetime.now().isoformat(),
+                            message_preview=''
+                        )
+
+                # Check OL twitter
+                if ol_twitter >= 0 and ol_twitter_status >= 0:
+                    handle = row[ol_twitter] if ol_twitter < len(row) else ''
+                    status = row[ol_twitter_status] if ol_twitter_status < len(row) else ''
+                    if handle and 'messaged' in status.lower():
+                        self.sent_dms[handle.lower()] = DMRecord(
+                            handle=handle, school='', sent_at=datetime.now().isoformat(),
+                            message_preview=''
+                        )
+
+            logger.info(f"Loaded {len(self.sent_dms)} sent DMs from Sheets")
+
+        except Exception as e:
+            logger.error(f"Error loading from sheets: {e}")
+
         # Reset daily count if new day
         today = date.today().isoformat()
         if self.last_reset_date != today:
             self.daily_count = 0
             self.last_reset_date = today
-            self._save()
-    
+
     def _save(self):
-        """Save tracking data to disk."""
-        os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
-        data = {
-            'sent_dms': {k: asdict(v) for k, v in self.sent_dms.items()},
-            'daily_count': self.daily_count,
-            'last_reset_date': self.last_reset_date,
-        }
-        with open(self.storage_path, 'w') as f:
-            json.dump(data, f, indent=2)
+        """Save is handled via sheet updates - no local files."""
+        pass
     
     def has_sent_to(self, handle: str) -> bool:
         """Check if we've already DM'd this handle."""
@@ -380,9 +444,9 @@ class TwitterDMSender:
             
             time.sleep(2)
             
-            # Mark as sent
+            # Mark as sent (local tracker for session)
             self.tracker.mark_sent(handle, school, coach_name, message)
-            
+
             logger.info(f"Successfully sent DM to @{handle}")
             
             return {
@@ -535,6 +599,126 @@ class TwitterDMSender:
             'remaining_today': max(0, self.config.max_dms_per_day - self.tracker.get_daily_count()),
             'recent': [asdict(dm) for dm in sent_list[-10:]]  # Last 10
         }
+
+    def send_to_coaches_from_sheet(
+        self,
+        sheets_manager,
+        template: str,
+        athlete_info: Dict[str, str],
+        callback: Callable = None
+    ) -> Dict[str, Any]:
+        """
+        Send DMs to coaches from Google Sheet, updating sheet with status.
+
+        This method:
+        - Gets coaches from sheet (skips responded/messaged/followed)
+        - Sends DMs
+        - Updates sheet with Twitter Status = "messaged"
+
+        Args:
+            sheets_manager: SheetsManager instance
+            template: Message template
+            athlete_info: Athlete details for template
+            callback: Optional callback(event, data) for progress
+
+        Returns:
+            Summary dict with sent/errors counts
+        """
+        sent = 0
+        errors = 0
+        skipped = 0
+
+        # Get coaches from sheet (already filtered)
+        coaches = sheets_manager.get_coaches_for_twitter()
+        logger.info(f"Found {len(coaches)} coaches to message on Twitter")
+
+        for i, coach in enumerate(coaches):
+            handle = coach.get('handle', '').lstrip('@')
+            if not handle:
+                skipped += 1
+                continue
+
+            # Check daily limit
+            if self.tracker.get_daily_count() >= self.config.max_dms_per_day:
+                if callback:
+                    callback('limit_reached', {'daily_count': self.tracker.get_daily_count()})
+                break
+
+            # Also check local tracker (for this session)
+            if self.tracker.has_sent_to(handle):
+                skipped += 1
+                continue
+
+            # Prepare message
+            last_name = coach.get('name', '').split()[-1] if coach.get('name') else ''
+            message = self.prepare_message(template, last_name, coach.get('school', ''), athlete_info)
+
+            if callback:
+                callback('sending', {
+                    'current': i + 1,
+                    'total': len(coaches),
+                    'handle': handle,
+                    'school': coach.get('school', '')
+                })
+
+            # Send DM
+            result = self.send_dm(
+                handle=handle,
+                message=message,
+                school=coach.get('school', ''),
+                coach_name=coach.get('name', '')
+            )
+
+            if result['success']:
+                sent += 1
+
+                # Update Google Sheet - mark as messaged
+                try:
+                    sheets_manager.update_twitter_status(
+                        coach['row_index'],
+                        coach['coach_type'],
+                        'messaged'
+                    )
+                    logger.info(f"Updated sheet: {coach['school']} {coach['coach_type']} Twitter = messaged")
+                except Exception as e:
+                    logger.warning(f"Failed to update sheet for {coach['school']}: {e}")
+
+                if callback:
+                    callback('sent', result)
+            else:
+                errors += 1
+                if callback:
+                    callback('error', result)
+
+            # Delay between messages
+            delay = random.uniform(
+                self.config.min_delay_seconds,
+                self.config.max_delay_seconds
+            )
+            time.sleep(delay)
+
+        return {
+            'sent': sent,
+            'errors': errors,
+            'skipped': skipped,
+            'daily_total': self.tracker.get_daily_count()
+        }
+
+    def mark_followed_on_sheet(self, sheets_manager, row_index: int, coach_type: str) -> bool:
+        """
+        Mark a coach as followed (can't DM) on the sheet.
+
+        Use this when you can only follow someone, not message them.
+        """
+        return sheets_manager.update_twitter_status(row_index, coach_type, 'followed')
+
+    def mark_wrong_twitter_on_sheet(self, sheets_manager, row_index: int, coach_type: str) -> bool:
+        """
+        Mark a coach's Twitter as wrong on the sheet.
+
+        Use this when the Twitter handle is incorrect.
+        """
+        return sheets_manager.update_twitter_status(row_index, coach_type, 'wrong')
 
 
 # ============================================================================

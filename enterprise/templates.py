@@ -223,62 +223,124 @@ OL_TEMPLATES = OC_TEMPLATES
 
 
 class TemplateManager:
-    """Manages templates with persistence, enable/disable, and user templates."""
-    
+    """Manages templates - NO LOCAL FILES, rotation stored in Google Sheets."""
+
     def __init__(self, data_dir: Path = None):
-        self.data_dir = data_dir or Path.home() / '.coach_outreach'
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.data_file = self.data_dir / 'templates.json'
-        
+        # NO LOCAL STORAGE - Everything in Google Sheets or code
         self.templates: Dict[str, EmailTemplate] = {}
         self.auto_rotate = True
         self._rotation_index: Dict[str, int] = {}
-        
+
         self._load()
+        # Load rotation index from Google Sheets for Railway persistence
+        self._load_rotation_from_sheets()
+
+    def _load_rotation_from_sheets(self):
+        """Load rotation index from Google Sheets Settings tab for Railway persistence."""
+        try:
+            import gspread
+            import os
+
+            google_creds = os.environ.get('GOOGLE_CREDENTIALS', '')
+            if not google_creds:
+                return
+
+            import json
+            import tempfile
+            from google.oauth2.service_account import Credentials
+
+            creds_str = google_creds.strip()
+            if creds_str.startswith('"') and creds_str.endswith('"'):
+                creds_str = creds_str[1:-1]
+            creds_str = creds_str.replace('\\\\n', '\\n')
+
+            temp_creds = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            temp_creds.write(creds_str)
+            temp_creds.close()
+
+            scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_file(temp_creds.name, scopes=scope)
+            client = gspread.authorize(creds)
+
+            spreadsheet = client.open('bardeen')
+            try:
+                settings_sheet = spreadsheet.worksheet('Settings')
+                all_data = settings_sheet.get_all_values()
+                for row in all_data[1:]:
+                    if len(row) >= 2:
+                        if row[0] == 'template_rotation_rc':
+                            self._rotation_index['rc'] = int(row[1]) if row[1] else 0
+                        elif row[0] == 'template_rotation_ol':
+                            self._rotation_index['ol'] = int(row[1]) if row[1] else 0
+                logger.info(f"Loaded rotation index from sheet: {self._rotation_index}")
+            except Exception as e:
+                logger.warning(f"Settings sheet not found, will create on first save: {e}")
+        except Exception as e:
+            logger.warning(f"Could not load rotation from sheets: {e}")
+
+    def _save_rotation_to_sheets(self):
+        """Save rotation index to Google Sheets Settings tab for Railway persistence."""
+        try:
+            import gspread
+            import os
+
+            google_creds = os.environ.get('GOOGLE_CREDENTIALS', '')
+            if not google_creds:
+                return
+
+            import json
+            import tempfile
+            from google.oauth2.service_account import Credentials
+
+            creds_str = google_creds.strip()
+            if creds_str.startswith('"') and creds_str.endswith('"'):
+                creds_str = creds_str[1:-1]
+            creds_str = creds_str.replace('\\\\n', '\\n')
+
+            temp_creds = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            temp_creds.write(creds_str)
+            temp_creds.close()
+
+            scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_file(temp_creds.name, scopes=scope)
+            client = gspread.authorize(creds)
+
+            spreadsheet = client.open('bardeen')
+            try:
+                settings_sheet = spreadsheet.worksheet('Settings')
+            except:
+                settings_sheet = spreadsheet.add_worksheet(title='Settings', rows=10, cols=2)
+                settings_sheet.update('A1:B1', [['Key', 'Value']])
+                settings_sheet.update('A2:B2', [['last_send_date', '']])
+                settings_sheet.update('A3:B3', [['template_rotation_rc', '0']])
+                settings_sheet.update('A4:B4', [['template_rotation_ol', '0']])
+
+            # Update rotation values
+            all_data = settings_sheet.get_all_values()
+            for i, row in enumerate(all_data):
+                if len(row) >= 1:
+                    if row[0] == 'template_rotation_rc':
+                        settings_sheet.update_cell(i + 1, 2, str(self._rotation_index.get('rc', 0)))
+                    elif row[0] == 'template_rotation_ol':
+                        settings_sheet.update_cell(i + 1, 2, str(self._rotation_index.get('ol', 0)))
+            logger.info(f"Saved rotation index to sheet: {self._rotation_index}")
+        except Exception as e:
+            logger.warning(f"Could not save rotation to sheets: {e}")
     
     def _load(self):
-        """Load templates from disk, merging with defaults."""
+        """Load templates - system templates from code, NO LOCAL FILES."""
+        # Load system templates from code (hardcoded)
         for t in RC_TEMPLATES + OC_TEMPLATES + FOLLOWUP_TEMPLATES + DM_TEMPLATES:
             self.templates[t.id] = t
-        
-        if self.data_file.exists():
-            try:
-                with open(self.data_file, 'r') as f:
-                    data = json.load(f)
-                
-                self.auto_rotate = data.get('auto_rotate', True)
-                
-                for tid, tdata in data.get('templates', {}).items():
-                    if tid in self.templates:
-                        self.templates[tid].enabled = tdata.get('enabled', True)
-                        self.templates[tid].usage_count = tdata.get('usage_count', 0)
-                    elif tdata.get('category') == 'user':
-                        self.templates[tid] = EmailTemplate(
-                            id=tdata['id'],
-                            name=tdata['name'],
-                            template_type=tdata['template_type'],
-                            category='user',
-                            subject=tdata.get('subject', ''),
-                            body=tdata['body'],
-                            enabled=tdata.get('enabled', True),
-                            usage_count=tdata.get('usage_count', 0),
-                            created_at=tdata.get('created_at', datetime.now().isoformat())
-                        )
-            except Exception as e:
-                logger.error(f"Error loading templates: {e}")
-    
+
+        # All templates are enabled by default - no local file storage
+
     def _save(self):
-        """Save templates to disk."""
-        try:
-            data = {
-                'auto_rotate': self.auto_rotate,
-                'templates': {tid: t.to_dict() for tid, t in self.templates.items()}
-            }
-            with open(self.data_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving templates: {e}")
-    
+        """Save template state - NO LOCAL FILES, rotation saved to Sheets."""
+        # Template definitions are in code, rotation is saved to Sheets
+        # No local file operations needed
+        pass
+
     def get_templates_by_type(self, template_type: str, enabled_only: bool = False) -> List[EmailTemplate]:
         """Get all templates of a type."""
         templates = [t for t in self.templates.values() if t.template_type == template_type]
@@ -345,20 +407,23 @@ class TemplateManager:
         templates = self.get_templates_by_type(template_type, enabled_only=True)
         if not templates:
             return None
-        
+
         if not self.auto_rotate:
             return random.choice(templates)
-        
+
         # Rotate globally across all emails of this type
         key = template_type
         idx = self._rotation_index.get(key, 0)
-        
+
         template = templates[idx % len(templates)]
         self._rotation_index[key] = idx + 1
-        
+
         template.usage_count += 1
         self._save()
-        
+
+        # Persist rotation to Google Sheets for Railway
+        self._save_rotation_to_sheets()
+
         return template
     
     def get_all_templates(self) -> List[dict]:

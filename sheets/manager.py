@@ -79,6 +79,18 @@ class SheetsConfig:
         'ol_contacted': 9,
         'rc_notes': 10,
         'ol_notes': 11,
+        # Follow-up tracking columns
+        'rc_followup_stage': 12,   # 0=intro, 1=follow1, 2=follow2, then restart
+        'rc_next_contact': 13,     # Date when to contact again
+        'ol_followup_stage': 14,
+        'ol_next_contact': 15,
+        # Response and status tracking
+        'rc_responded': 16,        # "yes" or date = stop all contact
+        'ol_responded': 17,
+        'rc_twitter_status': 18,   # "messaged" / "followed" / "wrong" / blank
+        'ol_twitter_status': 19,
+        'rc_email_status': 20,     # "wrong" = skip emails
+        'ol_email_status': 21,
     })
 
 
@@ -86,6 +98,11 @@ DEFAULT_HEADERS = [
     'School', 'URL', 'recruiting coordinator name', 'Oline Coach',
     'RC twitter', 'OC twitter', 'RC email', 'OC email',
     'RC Contacted', 'OL Contacted', 'RC Notes', 'OL Notes',
+    # Follow-up tracking
+    'RC Stage', 'RC Next Contact', 'OL Stage', 'OL Next Contact',
+    # Response and status tracking
+    'RC Responded', 'OL Responded', 'RC Twitter Status', 'OL Twitter Status',
+    'RC Email Status', 'OL Email Status',
 ]
 
 
@@ -436,22 +453,350 @@ class SheetsManager:
     def update_ol(self, row_index: int, name: str, email: str = None) -> bool:
         """Update OL name and optionally email."""
         success = True
-        
+
         col = self.get_col_index('ol_name') + 1  # 1-indexed
         if col > 0:
             success &= self.update_cell(row_index, col, name)
-        
+
         if email:
             col = self.get_col_index('ol_email') + 1
             if col > 0:
                 success &= self.update_cell(row_index, col, email)
-        
+
         return success
+
+    @retry_on_error(max_retries=3)
+    @rate_limited(min_delay=0.5)
+    def delete_row(self, row_index: int) -> bool:
+        """
+        Delete a row from the sheet.
+
+        Args:
+            row_index: Row number (1-indexed)
+
+        Returns:
+            True if successful
+        """
+        if not self._sheet:
+            return False
+        try:
+            self._sheet.delete_rows(row_index)
+            self._writes += 1
+            logger.info(f"Deleted row {row_index}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete row {row_index}: {e}")
+            self._errors += 1
+            return False
+
+    def update_email_status(self, row_index: int, coach_type: str, status: str) -> bool:
+        """
+        Update Email status for a coach.
+
+        Args:
+            row_index: Row number (1-indexed)
+            coach_type: 'rc' or 'ol'
+            status: 'wrong', 'bounced', or ''
+
+        Returns:
+            True if successful
+        """
+        if coach_type == 'rc':
+            col = self.get_col_index('rc_email_status') + 1
+        else:
+            col = self.get_col_index('ol_email_status') + 1
+
+        if col > 0:
+            return self.update_cell(row_index, col, status)
+        return False
     
     # =========================================================================
     # STATS
     # =========================================================================
     
+    # =========================================================================
+    # FOLLOW-UP TRACKING
+    # =========================================================================
+
+    def update_followup(self, row_index: int, coach_type: str, stage: int, next_contact: str) -> bool:
+        """
+        Update follow-up tracking for a coach.
+
+        Args:
+            row_index: Row number (1-indexed)
+            coach_type: 'rc' or 'ol'
+            stage: 0=intro sent, 1=follow1 sent, 2=follow2 sent
+            next_contact: Date string for next contact (MM/DD/YYYY)
+
+        Returns:
+            True if successful
+        """
+        success = True
+
+        if coach_type == 'rc':
+            stage_col = self.get_col_index('rc_followup_stage') + 1
+            next_col = self.get_col_index('rc_next_contact') + 1
+        else:
+            stage_col = self.get_col_index('ol_followup_stage') + 1
+            next_col = self.get_col_index('ol_next_contact') + 1
+
+        if stage_col > 0:
+            success &= self.update_cell(row_index, stage_col, str(stage))
+        if next_col > 0:
+            success &= self.update_cell(row_index, next_col, next_contact)
+
+        return success
+
+    def get_due_followups(self) -> List[Dict]:
+        """
+        Get all coaches due for follow-up (next_contact date is today or earlier).
+
+        Returns:
+            List of dicts with coach info and follow-up details
+        """
+        from datetime import datetime
+
+        data = self.get_all_data()
+        if len(data) < 2:
+            return []
+
+        rows = data[1:]
+        today = datetime.now().date()
+        due = []
+
+        for row_idx, row in enumerate(rows):
+            row_num = row_idx + 2
+            school = self._safe_get(row, self.get_col_index('school'))
+
+            if not school:
+                continue
+
+            # Check RC
+            rc_next = self._safe_get(row, self.get_col_index('rc_next_contact'))
+            if rc_next:
+                try:
+                    rc_date = datetime.strptime(rc_next, '%m/%d/%Y').date()
+                    if rc_date <= today:
+                        rc_stage = int(self._safe_get(row, self.get_col_index('rc_followup_stage')) or '0')
+                        due.append({
+                            'row_index': row_num,
+                            'school': school,
+                            'coach_type': 'rc',
+                            'name': self._safe_get(row, self.get_col_index('rc_name')),
+                            'email': self._safe_get(row, self.get_col_index('rc_email')),
+                            'stage': rc_stage,
+                            'is_restart': rc_stage >= 2,  # After stage 2, it's a restart
+                            'next_contact': rc_next,
+                        })
+                except ValueError:
+                    pass
+
+            # Check OL
+            ol_next = self._safe_get(row, self.get_col_index('ol_next_contact'))
+            if ol_next:
+                try:
+                    ol_date = datetime.strptime(ol_next, '%m/%d/%Y').date()
+                    if ol_date <= today:
+                        ol_stage = int(self._safe_get(row, self.get_col_index('ol_followup_stage')) or '0')
+                        due.append({
+                            'row_index': row_num,
+                            'school': school,
+                            'coach_type': 'ol',
+                            'name': self._safe_get(row, self.get_col_index('ol_name')),
+                            'email': self._safe_get(row, self.get_col_index('ol_email')),
+                            'stage': ol_stage,
+                            'is_restart': ol_stage >= 2,
+                            'next_contact': ol_next,
+                        })
+                except ValueError:
+                    pass
+
+        return due
+
+    def mark_contacted_with_followup(self, row_index: int, coach_type: str,
+                                      is_intro: bool = True) -> bool:
+        """
+        Mark a coach as contacted and schedule next follow-up.
+
+        Args:
+            row_index: Row number (1-indexed)
+            coach_type: 'rc' or 'ol'
+            is_intro: True if this was intro email, False if follow-up
+
+        Returns:
+            True if successful
+        """
+        from datetime import datetime, timedelta
+
+        today = datetime.now()
+        today_str = today.strftime('%m/%d/%Y')
+
+        # Update contacted date
+        if coach_type == 'rc':
+            contacted_col = self.get_col_index('rc_contacted') + 1
+            stage_col = self.get_col_index('rc_followup_stage')
+        else:
+            contacted_col = self.get_col_index('ol_contacted') + 1
+            stage_col = self.get_col_index('ol_followup_stage')
+
+        # Get current stage
+        data = self.get_all_data()
+        if row_index - 1 >= len(data):
+            return False
+
+        row = data[row_index - 1] if row_index <= len(data) else []
+        current_stage = int(self._safe_get(row, stage_col) or '0')
+
+        if is_intro:
+            new_stage = 0
+        else:
+            new_stage = current_stage + 1
+
+        # Calculate next contact (3 days later)
+        next_contact = today + timedelta(days=3)
+        next_contact_str = next_contact.strftime('%m/%d/%Y')
+
+        # If we just did follow-up 2 (stage 2), next is restart (stage resets to 0)
+        if new_stage >= 2:
+            new_stage = 2  # Cap at 2, next send will be restart
+
+        # Update sheet
+        success = True
+        success &= self.update_cell(row_index, contacted_col, today_str)
+        success &= self.update_followup(row_index, coach_type, new_stage, next_contact_str)
+
+        return success
+
+    def clear_followup(self, row_index: int, coach_type: str) -> bool:
+        """Clear follow-up tracking (e.g., when coach responds)."""
+        if coach_type == 'rc':
+            stage_col = self.get_col_index('rc_followup_stage') + 1
+            next_col = self.get_col_index('rc_next_contact') + 1
+        else:
+            stage_col = self.get_col_index('ol_followup_stage') + 1
+            next_col = self.get_col_index('ol_next_contact') + 1
+
+        success = True
+        if stage_col > 0:
+            success &= self.update_cell(row_index, stage_col, '')
+        if next_col > 0:
+            success &= self.update_cell(row_index, next_col, '')
+
+        return success
+
+    def get_coaches_for_twitter(self) -> List[Dict]:
+        """
+        Get coaches to message on Twitter.
+
+        Skips coaches who:
+        - Have responded (RC/OL Responded is set)
+        - Already messaged on Twitter (Twitter Status = "messaged")
+        - Can only be followed (Twitter Status = "followed")
+        - Have wrong Twitter handle (Twitter Status = "wrong")
+
+        Returns:
+            List of dicts with coach info for Twitter messaging
+        """
+        data = self.get_all_data()
+        if len(data) < 2:
+            return []
+
+        headers = data[0]
+        rows = data[1:]
+        coaches = []
+
+        for row_idx, row in enumerate(rows):
+            row_num = row_idx + 2
+            school = self._safe_get(row, self.get_col_index('school'))
+
+            if not school:
+                continue
+
+            # Check RC
+            rc_twitter = self._safe_get(row, self.get_col_index('rc_twitter'))
+            rc_responded = self._safe_get(row, self.get_col_index('rc_responded'))
+            rc_twitter_status = self._safe_get(row, self.get_col_index('rc_twitter_status')).lower()
+
+            if rc_twitter and not rc_responded:
+                # Skip if already messaged, followed, or wrong
+                if rc_twitter_status not in ['messaged', 'followed', 'wrong']:
+                    coaches.append({
+                        'row_index': row_num,
+                        'school': school,
+                        'coach_type': 'rc',
+                        'name': self._safe_get(row, self.get_col_index('rc_name')),
+                        'handle': rc_twitter,
+                        'email': self._safe_get(row, self.get_col_index('rc_email')),
+                    })
+
+            # Check OL
+            ol_twitter = self._safe_get(row, self.get_col_index('ol_twitter'))
+            ol_responded = self._safe_get(row, self.get_col_index('ol_responded'))
+            ol_twitter_status = self._safe_get(row, self.get_col_index('ol_twitter_status')).lower()
+
+            if ol_twitter and not ol_responded:
+                # Skip if already messaged, followed, or wrong
+                if ol_twitter_status not in ['messaged', 'followed', 'wrong']:
+                    coaches.append({
+                        'row_index': row_num,
+                        'school': school,
+                        'coach_type': 'ol',
+                        'name': self._safe_get(row, self.get_col_index('ol_name')),
+                        'handle': ol_twitter,
+                        'email': self._safe_get(row, self.get_col_index('ol_email')),
+                    })
+
+        return coaches
+
+    def update_twitter_status(self, row_index: int, coach_type: str, status: str) -> bool:
+        """
+        Update Twitter status for a coach.
+
+        Args:
+            row_index: Row number (1-indexed)
+            coach_type: 'rc' or 'ol'
+            status: 'messaged', 'followed', 'wrong', or ''
+
+        Returns:
+            True if successful
+        """
+        if coach_type == 'rc':
+            col = self.get_col_index('rc_twitter_status') + 1
+        else:
+            col = self.get_col_index('ol_twitter_status') + 1
+
+        if col > 0:
+            return self.update_cell(row_index, col, status)
+        return False
+
+    def mark_responded(self, row_index: int, coach_type: str, date_str: str = None) -> bool:
+        """
+        Mark a coach as having responded (stops all contact).
+
+        Args:
+            row_index: Row number (1-indexed)
+            coach_type: 'rc' or 'ol'
+            date_str: Optional date string, defaults to today
+
+        Returns:
+            True if successful
+        """
+        from datetime import date as date_cls
+
+        if date_str is None:
+            date_str = date_cls.today().strftime('%m/%d/%Y')
+
+        if coach_type == 'rc':
+            col = self.get_col_index('rc_responded') + 1
+        else:
+            col = self.get_col_index('ol_responded') + 1
+
+        if col > 0:
+            # Also clear follow-up tracking
+            self.clear_followup(row_index, coach_type)
+            return self.update_cell(row_index, col, date_str)
+        return False
+
     def get_stats(self) -> Dict[str, int]:
         """Get basic stats from sheet."""
         try:

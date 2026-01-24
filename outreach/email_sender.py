@@ -460,6 +460,39 @@ class SmartEmailSender:
         # Contacted columns
         ol_contacted_col = find_col(['ol contacted', 'oc contacted', 'oline contacted', 'position contacted'])
         rc_contacted_col = find_col(['rc contacted', 'recruiting contacted'])
+
+        # Follow-up tracking columns
+        rc_stage_col = find_col(['rc stage'])
+        rc_next_col = find_col(['rc next contact', 'rc next'])
+        ol_stage_col = find_col(['ol stage'])
+        ol_next_col = find_col(['ol next contact', 'ol next'])
+
+        # Response and status columns (skip coaches who responded or have bad email)
+        rc_responded_col = find_col(['rc responded'])
+        ol_responded_col = find_col(['ol responded'])
+        rc_email_status_col = find_col(['rc email status'])
+        ol_email_status_col = find_col(['ol email status'])
+
+        def has_responded(value):
+            """Check if coach has responded (any non-empty value)"""
+            return bool(value and str(value).strip())
+
+        def has_bad_email(value):
+            """Check if email is marked as wrong/bad"""
+            if not value:
+                return False
+            return str(value).strip().lower() in ['wrong', 'bad', 'invalid', 'bounced']
+
+        def is_due_for_followup(next_contact_value):
+            """Check if next_contact date is today or earlier"""
+            if not next_contact_value:
+                return False
+            try:
+                from datetime import datetime
+                next_date = datetime.strptime(next_contact_value.strip(), '%m/%d/%Y').date()
+                return next_date <= datetime.now().date()
+            except ValueError:
+                return False
         
         # Log column detection for debugging
         logger.info(f"=== COLUMN DETECTION ===")
@@ -498,11 +531,34 @@ class SmartEmailSender:
                 # Check contacted status
                 ol_contacted = is_contacted(ol_contacted_raw)
                 rc_contacted = is_contacted(rc_contacted_raw)
-                
+
+                # Check follow-up status (due for follow-up?)
+                ol_next_raw = row[ol_next_col] if ol_next_col >= 0 and ol_next_col < len(row) else ''
+                rc_next_raw = row[rc_next_col] if rc_next_col >= 0 and rc_next_col < len(row) else ''
+                ol_stage_raw = row[ol_stage_col] if ol_stage_col >= 0 and ol_stage_col < len(row) else ''
+                rc_stage_raw = row[rc_stage_col] if rc_stage_col >= 0 and rc_stage_col < len(row) else ''
+
+                # Check responded status (skip if responded)
+                rc_responded_raw = row[rc_responded_col] if rc_responded_col >= 0 and rc_responded_col < len(row) else ''
+                ol_responded_raw = row[ol_responded_col] if ol_responded_col >= 0 and ol_responded_col < len(row) else ''
+                rc_responded = has_responded(rc_responded_raw)
+                ol_responded = has_responded(ol_responded_raw)
+
+                # Check email status (skip if marked as wrong/bad)
+                rc_email_status_raw = row[rc_email_status_col] if rc_email_status_col >= 0 and rc_email_status_col < len(row) else ''
+                ol_email_status_raw = row[ol_email_status_col] if ol_email_status_col >= 0 and ol_email_status_col < len(row) else ''
+                rc_bad_email = has_bad_email(rc_email_status_raw)
+                ol_bad_email = has_bad_email(ol_email_status_raw)
+
+                ol_due_followup = is_due_for_followup(ol_next_raw)
+                rc_due_followup = is_due_for_followup(rc_next_raw)
+                ol_stage = int(ol_stage_raw) if ol_stage_raw.strip().isdigit() else 0
+                rc_stage = int(rc_stage_raw) if rc_stage_raw.strip().isdigit() else 0
+
                 # Log first few rows for debugging
                 if row_idx < 3:
-                    logger.info(f"Row {row_idx+2}: {school} | OL: {ol_email} (contacted: {ol_contacted}) | RC: {rc_email} (contacted: {rc_contacted})")
-                
+                    logger.info(f"Row {row_idx+2}: {school} | OL: {ol_email} (contacted: {ol_contacted}, due: {ol_due_followup}) | RC: {rc_email} (contacted: {rc_contacted}, due: {rc_due_followup})")
+
                 # Log any invalid emails for debugging
                 if ol_email_raw and not ol_email:
                     logger.warning(f"Row {row_idx+2}: Invalid OL email for {school}: '{ol_email_raw}'")
@@ -510,16 +566,27 @@ class SmartEmailSender:
                 if rc_email_raw and not rc_email:
                     logger.warning(f"Row {row_idx+2}: Invalid RC email for {school}: '{rc_email_raw}'")
                     skipped_invalid += 1
-                
+
                 # Check if same person (same email for both roles)
                 is_dual_role = ol_email and rc_email and ol_email == rc_email
-                
+
                 if is_dual_role:
                     # Same person does both - send one email with dual template
-                    if ol_email and not ol_contacted and not rc_contacted:
-                        if ol_email not in seen_emails and not self.tracker.has_sent_to(ol_email):
+                    # SKIP if: responded OR bad email
+                    if rc_responded or ol_responded:
+                        skipped_contacted += 1
+                        continue
+                    if rc_bad_email or ol_bad_email:
+                        skipped_invalid += 1
+                        continue
+
+                    # Include if: never contacted OR due for follow-up
+                    should_email = (not ol_contacted and not rc_contacted) or ol_due_followup or rc_due_followup
+                    if ol_email and should_email:
+                        if ol_email not in seen_emails:
                             seen_emails.add(ol_email)
                             name = ol_name or rc_name
+                            is_followup = ol_contacted or rc_contacted
                             coaches.append({
                                 'email': ol_email,
                                 'name': name,
@@ -529,15 +596,19 @@ class SmartEmailSender:
                                 'row_idx': row_idx + 2,  # 1-indexed, skip header
                                 'row_ol_contacted_col': ol_contacted_col + 1 if ol_contacted_col >= 0 else None,
                                 'row_rc_contacted_col': rc_contacted_col + 1 if rc_contacted_col >= 0 else None,
+                                'is_followup': is_followup,
+                                'current_stage': max(ol_stage, rc_stage),
                             })
-                    else:
+                    elif ol_contacted:
                         skipped_contacted += 1
                 else:
                     # Different people or only one role
-                    
-                    # OL Coach
-                    if ol_email and not ol_contacted:
-                        if ol_email not in seen_emails and not self.tracker.has_sent_to(ol_email):
+
+                    # OL Coach - SKIP if responded or bad email
+                    ol_skip = ol_responded or ol_bad_email
+                    ol_should_email = not ol_skip and ((not ol_contacted) or ol_due_followup)
+                    if ol_email and ol_should_email:
+                        if ol_email not in seen_emails:
                             seen_emails.add(ol_email)
                             coaches.append({
                                 'email': ol_email,
@@ -547,13 +618,17 @@ class SmartEmailSender:
                                 'type': 'ol',
                                 'row_idx': row_idx + 2,
                                 'contacted_col': ol_contacted_col + 1 if ol_contacted_col >= 0 else None,
+                                'is_followup': ol_contacted,
+                                'current_stage': ol_stage,
                             })
-                    elif ol_email and ol_contacted:
+                    elif ol_email and (ol_contacted or ol_responded or ol_bad_email) and not ol_due_followup:
                         skipped_contacted += 1
-                    
-                    # RC
-                    if rc_email and not rc_contacted:
-                        if rc_email not in seen_emails and not self.tracker.has_sent_to(rc_email):
+
+                    # RC - SKIP if responded or bad email
+                    rc_skip = rc_responded or rc_bad_email
+                    rc_should_email = not rc_skip and ((not rc_contacted) or rc_due_followup)
+                    if rc_email and rc_should_email:
+                        if rc_email not in seen_emails:
                             seen_emails.add(rc_email)
                             coaches.append({
                                 'email': rc_email,
@@ -563,8 +638,10 @@ class SmartEmailSender:
                                 'type': 'rc',
                                 'row_idx': row_idx + 2,
                                 'contacted_col': rc_contacted_col + 1 if rc_contacted_col >= 0 else None,
+                                'is_followup': rc_contacted,
+                                'current_stage': rc_stage,
                             })
-                    elif rc_email and rc_contacted:
+                    elif rc_email and (rc_contacted or rc_responded or rc_bad_email) and not rc_due_followup:
                         skipped_contacted += 1
                         
             except Exception as e:
@@ -768,38 +845,53 @@ class SmartEmailSender:
                     self.tracker.mark_sent(email, coach['school'], coach['type'])
                     self.analytics.record_email_sent(coach['school'], coach['type'])
                     
-                    # Create follow-up reminders if enabled
-                    if self.config.enable_followups:
-                        try:
-                            from enterprise.followups import get_followup_manager
-                            followup_mgr = get_followup_manager()
-                            followup_mgr.record_email_sent(
-                                coach_name=coach.get('name', 'Coach'),
-                                coach_email=email,
-                                school=coach['school'],
-                                coach_type=coach['type'],
-                                subject=subject,
-                                template_id=coach.get('template_id', '')
-                            )
-                            logger.info(f"Follow-ups scheduled for {coach['school']}")
-                        except ImportError:
-                            pass  # Enterprise module not available
-                        except Exception as e:
-                            logger.warning(f"Failed to create follow-up: {e}")
-                    
-                    # Update sheet - mark as contacted
+                    # Update sheet - mark as contacted AND schedule follow-up
                     if sheet and coach.get('row_idx'):
                         try:
-                            today = date.today().strftime('%m/%d/%Y')
+                            from datetime import timedelta
+                            today = date.today()
+                            today_str = today.strftime('%m/%d/%Y')
+                            next_contact = (today + timedelta(days=3)).strftime('%m/%d/%Y')
                             row_num = coach['row_idx']
-                            if coach['type'] == 'dual':
-                                if coach.get('row_ol_contacted_col'):
-                                    sheet.update_cell(row_num, coach['row_ol_contacted_col'], today)
-                                if coach.get('row_rc_contacted_col'):
-                                    sheet.update_cell(row_num, coach['row_rc_contacted_col'], today)
+
+                            # Get current stage (0=intro, 1=follow1, 2=follow2)
+                            current_stage = coach.get('current_stage', 0)
+                            is_followup = coach.get('is_followup', False)
+
+                            if is_followup:
+                                new_stage = min(current_stage + 1, 2)
                             else:
+                                new_stage = 0  # Intro email
+
+                            # Column indices for follow-up tracking (1-indexed for gspread)
+                            RC_STAGE_COL = 13
+                            RC_NEXT_COL = 14
+                            OL_STAGE_COL = 15
+                            OL_NEXT_COL = 16
+
+                            if coach['type'] == 'dual':
+                                # Update both RC and OL contacted dates
+                                if coach.get('row_ol_contacted_col'):
+                                    sheet.update_cell(row_num, coach['row_ol_contacted_col'], today_str)
+                                if coach.get('row_rc_contacted_col'):
+                                    sheet.update_cell(row_num, coach['row_rc_contacted_col'], today_str)
+                                # Update follow-up tracking for both
+                                sheet.update_cell(row_num, RC_STAGE_COL, str(new_stage))
+                                sheet.update_cell(row_num, RC_NEXT_COL, next_contact)
+                                sheet.update_cell(row_num, OL_STAGE_COL, str(new_stage))
+                                sheet.update_cell(row_num, OL_NEXT_COL, next_contact)
+                            elif coach['type'] == 'rc':
                                 if coach.get('contacted_col'):
-                                    sheet.update_cell(row_num, coach['contacted_col'], today)
+                                    sheet.update_cell(row_num, coach['contacted_col'], today_str)
+                                sheet.update_cell(row_num, RC_STAGE_COL, str(new_stage))
+                                sheet.update_cell(row_num, RC_NEXT_COL, next_contact)
+                            else:  # ol
+                                if coach.get('contacted_col'):
+                                    sheet.update_cell(row_num, coach['contacted_col'], today_str)
+                                sheet.update_cell(row_num, OL_STAGE_COL, str(new_stage))
+                                sheet.update_cell(row_num, OL_NEXT_COL, next_contact)
+
+                            logger.info(f"Updated sheet: {coach['school']} stage={new_stage}, next={next_contact}")
                         except Exception as e:
                             logger.warning(f"Failed to update sheet: {e}")
                     
@@ -812,12 +904,61 @@ class SmartEmailSender:
                         })
                 else:
                     errors += 1
+                    error_lower = error.lower() if error else ''
+
+                    # Determine error type
+                    is_blocked = any(x in error_lower for x in [
+                        'blocked', 'banned', 'suspended', 'authentication',
+                        'sender refused', '550 5.7', 'policy', 'spam'
+                    ])
+                    is_invalid_email = any(x in error_lower for x in [
+                        'recipient', 'mailbox', 'user unknown', 'does not exist',
+                        '550', '551', '552', '553', '554', 'invalid', 'rejected'
+                    ])
+
+                    # Update sheet based on error type
+                    if sheet and coach.get('row_idx'):
+                        row_num = coach['row_idx']
+                        # Email Status columns (1-indexed)
+                        RC_EMAIL_STATUS_COL = 21
+                        OL_EMAIL_STATUS_COL = 22
+
+                        try:
+                            if is_blocked:
+                                # We got blocked - delete this row entirely
+                                logger.error(f"BLOCKED sending to {coach['school']} - removing from sheet")
+                                sheet.delete_rows(row_num)
+                                if callback:
+                                    callback('coach_removed', {
+                                        'school': coach['school'],
+                                        'reason': 'blocked',
+                                        'error': error
+                                    })
+                            elif is_invalid_email:
+                                # Wrong email - mark as "wrong" so scraper will re-scrape
+                                logger.warning(f"Invalid email for {coach['school']} - marking as wrong")
+                                if coach['type'] == 'dual':
+                                    sheet.update_cell(row_num, RC_EMAIL_STATUS_COL, 'wrong')
+                                    sheet.update_cell(row_num, OL_EMAIL_STATUS_COL, 'wrong')
+                                elif coach['type'] == 'rc':
+                                    sheet.update_cell(row_num, RC_EMAIL_STATUS_COL, 'wrong')
+                                else:  # ol
+                                    sheet.update_cell(row_num, OL_EMAIL_STATUS_COL, 'wrong')
+                        except Exception as e:
+                            logger.warning(f"Failed to update sheet for error: {e}")
+
                     if callback:
                         callback('email_error', {
                             'school': coach['school'],
                             'email': email,
-                            'error': error
+                            'error': error,
+                            'error_type': 'blocked' if is_blocked else ('invalid_email' if is_invalid_email else 'unknown')
                         })
+
+                    # If we got blocked, stop sending entirely
+                    if is_blocked:
+                        logger.error("Account appears blocked - stopping email sending")
+                        break
                 
                 # Delay
                 if i < len(coaches) - 1:

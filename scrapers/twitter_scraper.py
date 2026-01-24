@@ -433,14 +433,20 @@ class TwitterScraper:
         self._running = False
     
     def _get_schools_needing_twitter(self) -> List[Dict]:
-        """Get schools that need Twitter handles."""
+        """
+        Get schools that need Twitter handles.
+
+        Includes schools where:
+        - Coach has name but no Twitter
+        - Twitter Status is 'wrong' (bad handle, needs re-scrape)
+        """
         data = self.sheets.get_all_data()
         if len(data) < 2:
             return []
-        
+
         headers = data[0]
         rows = data[1:]
-        
+
         # Find columns
         def find_col(keywords):
             for i, h in enumerate(headers):
@@ -449,32 +455,42 @@ class TwitterScraper:
                     if kw in h_lower:
                         return i
             return -1
-        
+
         school_col = find_col(['school'])
         url_col = find_col(['url'])
         ol_name_col = find_col(['oline', 'ol coach'])
         rc_name_col = find_col(['recruiting'])
         ol_twitter_col = find_col(['oc twitter', 'ol twitter'])
         rc_twitter_col = find_col(['rc twitter'])
-        
+        # New: Twitter status columns for re-scraping
+        ol_twitter_status_col = find_col(['ol twitter status'])
+        rc_twitter_status_col = find_col(['rc twitter status'])
+
         schools = []
-        
+
         for row_idx, row in enumerate(rows):
             row_num = row_idx + 2
-            
+
             school = row[school_col] if school_col >= 0 and school_col < len(row) else ''
             url = row[url_col] if url_col >= 0 and url_col < len(row) else ''
             ol_name = row[ol_name_col] if ol_name_col >= 0 and ol_name_col < len(row) else ''
             rc_name = row[rc_name_col] if rc_name_col >= 0 and rc_name_col < len(row) else ''
             ol_twitter = row[ol_twitter_col] if ol_twitter_col >= 0 and ol_twitter_col < len(row) else ''
             rc_twitter = row[rc_twitter_col] if rc_twitter_col >= 0 and rc_twitter_col < len(row) else ''
-            
+            ol_twitter_status = row[ol_twitter_status_col] if ol_twitter_status_col >= 0 and ol_twitter_status_col < len(row) else ''
+            rc_twitter_status = row[rc_twitter_status_col] if rc_twitter_status_col >= 0 and rc_twitter_status_col < len(row) else ''
+
             if not url or not url.startswith('http'):
                 continue
-            
-            needs_ol = ol_name and not ol_name.startswith('REVIEW:') and not ol_twitter
-            needs_rc = rc_name and not rc_name.startswith('REVIEW:') and not rc_twitter
-            
+
+            # Check if Twitter status is "wrong" (needs re-scrape)
+            ol_twitter_wrong = ol_twitter_status.strip().lower() == 'wrong'
+            rc_twitter_wrong = rc_twitter_status.strip().lower() == 'wrong'
+
+            # Need to scrape if: no Twitter OR Twitter marked as wrong
+            needs_ol = ol_name and not ol_name.startswith('REVIEW:') and (not ol_twitter or ol_twitter_wrong)
+            needs_rc = rc_name and not rc_name.startswith('REVIEW:') and (not rc_twitter or rc_twitter_wrong)
+
             if needs_ol or needs_rc:
                 schools.append({
                     'row': row_num,
@@ -484,8 +500,12 @@ class TwitterScraper:
                     'rc_name': rc_name if needs_rc else '',
                     'ol_twitter_col': ol_twitter_col + 1,  # 1-indexed
                     'rc_twitter_col': rc_twitter_col + 1,
+                    'ol_twitter_status_col': ol_twitter_status_col + 1 if ol_twitter_status_col >= 0 else None,
+                    'rc_twitter_status_col': rc_twitter_status_col + 1 if rc_twitter_status_col >= 0 else None,
+                    'ol_needs_rescrape': ol_twitter_wrong,
+                    'rc_needs_rescrape': rc_twitter_wrong,
                 })
-        
+
         return schools
     
     def _process_school(self, school: Dict, callback: Callable):
@@ -517,14 +537,22 @@ class TwitterScraper:
                             school['ol_twitter_col'],
                             f"@{handle}"
                         )
+                        # Clear "wrong" status if this was a re-scrape
+                        if school.get('ol_needs_rescrape') and school.get('ol_twitter_status_col'):
+                            self.sheets.update_cell(
+                                school['row'],
+                                school['ol_twitter_status_col'],
+                                ''  # Clear the "wrong" status
+                            )
                         ol_found = True
                         self.found += 1
                         self._emit(callback, 'found', {
                             'school': school['name'],
                             'type': 'OL',
-                            'handle': f"@{handle}"
+                            'handle': f"@{handle}",
+                            'was_rescrape': school.get('ol_needs_rescrape', False)
                         })
-                
+
                 # Check RC
                 if school.get('rc_name') and not rc_found:
                     rc_last = school['rc_name'].split()[-1].lower() if school['rc_name'] else ''
@@ -534,12 +562,20 @@ class TwitterScraper:
                             school['rc_twitter_col'],
                             f"@{handle}"
                         )
+                        # Clear "wrong" status if this was a re-scrape
+                        if school.get('rc_needs_rescrape') and school.get('rc_twitter_status_col'):
+                            self.sheets.update_cell(
+                                school['row'],
+                                school['rc_twitter_status_col'],
+                                ''  # Clear the "wrong" status
+                            )
                         rc_found = True
                         self.found += 1
                         self._emit(callback, 'found', {
                             'school': school['name'],
                             'type': 'RC',
-                            'handle': f"@{handle}"
+                            'handle': f"@{handle}",
+                            'was_rescrape': school.get('rc_needs_rescrape', False)
                         })
             
             # FALLBACK: If not found on staff page, try Google search
@@ -547,24 +583,32 @@ class TwitterScraper:
                 handle = self._google_search_twitter(school['ol_name'], school['name'])
                 if handle:
                     self.sheets.update_cell(school['row'], school['ol_twitter_col'], f"@{handle}")
+                    # Clear "wrong" status if this was a re-scrape
+                    if school.get('ol_needs_rescrape') and school.get('ol_twitter_status_col'):
+                        self.sheets.update_cell(school['row'], school['ol_twitter_status_col'], '')
                     ol_found = True
                     self.found += 1
                     self._emit(callback, 'found', {
                         'school': school['name'],
                         'type': 'OL (Google)',
-                        'handle': f"@{handle}"
+                        'handle': f"@{handle}",
+                        'was_rescrape': school.get('ol_needs_rescrape', False)
                     })
-            
+
             if not rc_found and school.get('rc_name'):
                 handle = self._google_search_twitter(school['rc_name'], school['name'])
                 if handle:
                     self.sheets.update_cell(school['row'], school['rc_twitter_col'], f"@{handle}")
+                    # Clear "wrong" status if this was a re-scrape
+                    if school.get('rc_needs_rescrape') and school.get('rc_twitter_status_col'):
+                        self.sheets.update_cell(school['row'], school['rc_twitter_status_col'], '')
                     rc_found = True
                     self.found += 1
                     self._emit(callback, 'found', {
                         'school': school['name'],
                         'type': 'RC (Google)',
-                        'handle': f"@{handle}"
+                        'handle': f"@{handle}",
+                        'was_rescrape': school.get('rc_needs_rescrape', False)
                     })
             
             self.processed += 1

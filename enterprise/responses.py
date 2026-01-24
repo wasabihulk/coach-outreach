@@ -166,50 +166,143 @@ class GmailResponseChecker:
 
 
 class ResponseTracker:
-    """Track sent emails and responses with analytics."""
-    
+    """Track sent emails and responses with analytics - ALL DATA IN GOOGLE SHEETS."""
+
     def __init__(self, data_dir: Path = None):
-        self.data_dir = data_dir or Path.home() / '.coach_outreach'
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.data_file = self.data_dir / 'response_tracking.json'
-        
+        # NO LOCAL STORAGE - Everything goes to Google Sheets
         self.sent_emails: List[SentEmail] = []
         self.responses: List[Response] = []
-        self._load()
-    
-    def _load(self):
-        """Load data from disk."""
-        if self.data_file.exists():
-            try:
-                with open(self.data_file, 'r') as f:
-                    data = json.load(f)
-                
-                self.sent_emails = [
-                    SentEmail(**e) for e in data.get('sent_emails', [])
-                ]
-                self.responses = [
-                    Response(**r) for r in data.get('responses', [])
-                ]
-            except Exception as e:
-                logger.error(f"Error loading response data: {e}")
-    
-    def _save(self):
-        """Save data to disk."""
+        self._sheets_client = None
+        self._spreadsheet = None
+        self._load_from_sheets()
+
+    def _get_sheets_connection(self):
+        """Get Google Sheets connection."""
+        if self._sheets_client:
+            return self._sheets_client, self._spreadsheet
+
         try:
-            data = {
-                'sent_emails': [e.to_dict() for e in self.sent_emails],
-                'responses': [r.to_dict() for r in self.responses]
-            }
-            with open(self.data_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            import gspread
+            import os
+            import tempfile
+            from google.oauth2.service_account import Credentials
+
+            google_creds = os.environ.get('GOOGLE_CREDENTIALS', '')
+            if not google_creds:
+                # Try local credentials file
+                creds_file = Path(__file__).parent.parent / 'credentials.json'
+                if creds_file.exists():
+                    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+                    creds = Credentials.from_service_account_file(str(creds_file), scopes=scope)
+                    self._sheets_client = gspread.authorize(creds)
+                    self._spreadsheet = self._sheets_client.open('bardeen')
+                    return self._sheets_client, self._spreadsheet
+                return None, None
+
+            creds_str = google_creds.strip()
+            if creds_str.startswith('"') and creds_str.endswith('"'):
+                creds_str = creds_str[1:-1]
+            creds_str = creds_str.replace('\\\\n', '\\n')
+
+            temp_creds = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            temp_creds.write(creds_str)
+            temp_creds.close()
+
+            scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_file(temp_creds.name, scopes=scope)
+            self._sheets_client = gspread.authorize(creds)
+            self._spreadsheet = self._sheets_client.open('bardeen')
+            return self._sheets_client, self._spreadsheet
         except Exception as e:
-            logger.error(f"Error saving response data: {e}")
+            logger.error(f"Sheets connection error: {e}")
+            return None, None
+
+    def _get_or_create_email_log_sheet(self):
+        """Get or create the EmailLog worksheet."""
+        client, spreadsheet = self._get_sheets_connection()
+        if not spreadsheet:
+            return None
+
+        try:
+            return spreadsheet.worksheet('EmailLog')
+        except:
+            # Create the worksheet
+            sheet = spreadsheet.add_worksheet(title='EmailLog', rows=1000, cols=10)
+            sheet.update('A1:J1', [['coach_email', 'coach_name', 'school', 'division', 'coach_type',
+                                    'template_id', 'followup_number', 'sent_at', 'responded', 'response_date']])
+            logger.info("Created EmailLog worksheet")
+            return sheet
+
+    def _load_from_sheets(self):
+        """Load sent emails and responses from Google Sheets."""
+        try:
+            sheet = self._get_or_create_email_log_sheet()
+            if not sheet:
+                return
+
+            all_data = sheet.get_all_values()
+            if len(all_data) < 2:
+                return
+
+            headers = all_data[0]
+            for row in all_data[1:]:
+                if len(row) < 8:
+                    continue
+                try:
+                    self.sent_emails.append(SentEmail(
+                        coach_email=row[0],
+                        coach_name=row[1],
+                        school=row[2],
+                        division=row[3],
+                        coach_type=row[4],
+                        template_id=row[5],
+                        followup_number=int(row[6]) if row[6] else 0,
+                        sent_at=row[7]
+                    ))
+                    # Check if responded
+                    if len(row) > 8 and row[8].lower() == 'yes':
+                        self.responses.append(Response(
+                            coach_email=row[0],
+                            coach_name=row[1],
+                            school=row[2],
+                            subject='',
+                            snippet='',
+                            received_at=row[9] if len(row) > 9 else ''
+                        ))
+                except Exception as e:
+                    logger.warning(f"Error loading row: {e}")
+
+            logger.info(f"Loaded {len(self.sent_emails)} sent emails, {len(self.responses)} responses from Sheets")
+        except Exception as e:
+            logger.error(f"Error loading from sheets: {e}")
+
+    def _save_to_sheets(self, sent_email: SentEmail):
+        """Save a sent email record to Google Sheets."""
+        try:
+            sheet = self._get_or_create_email_log_sheet()
+            if not sheet:
+                return
+
+            sheet.append_row([
+                sent_email.coach_email,
+                sent_email.coach_name,
+                sent_email.school,
+                sent_email.division,
+                sent_email.coach_type,
+                sent_email.template_id,
+                sent_email.followup_number,
+                sent_email.sent_at,
+                '',  # responded
+                ''   # response_date
+            ])
+        except Exception as e:
+            logger.error(f"Error saving to sheets: {e}")
     
     def record_sent(self, coach_email: str, coach_name: str, school: str,
                     division: str, coach_type: str, template_id: str = '',
                     followup_number: int = 0) -> None:
-        """Record a sent email."""
-        self.sent_emails.append(SentEmail(
+        """Record a sent email - saves to Google Sheets."""
+        sent_email = SentEmail(
             coach_email=coach_email.lower().strip(),
             coach_name=coach_name,
             school=school,
@@ -217,31 +310,56 @@ class ResponseTracker:
             coach_type=coach_type,
             template_id=template_id,
             followup_number=followup_number
-        ))
-        self._save()
-    
+        )
+        self.sent_emails.append(sent_email)
+        # Save to Google Sheets (not local file)
+        self._save_to_sheets(sent_email)
+
     def record_response(self, coach_email: str, subject: str, snippet: str,
                        received_at: str = None) -> None:
-        """Record a response."""
+        """Record a response - updates Google Sheets."""
         # Find coach info from sent emails
         coach_name = ''
         school = ''
-        
+
         for sent in reversed(self.sent_emails):
             if sent.coach_email.lower() == coach_email.lower():
                 coach_name = sent.coach_name
                 school = sent.school
                 break
-        
-        self.responses.append(Response(
+
+        response = Response(
             coach_email=coach_email.lower().strip(),
             coach_name=coach_name,
             school=school,
             subject=subject,
             snippet=snippet,
             received_at=received_at or datetime.now().isoformat()
-        ))
-        self._save()
+        )
+        self.responses.append(response)
+
+        # Update Google Sheets - mark as responded
+        self._mark_responded_in_sheets(coach_email, received_at or datetime.now().isoformat())
+
+    def _mark_responded_in_sheets(self, coach_email: str, response_date: str):
+        """Mark a coach as responded in the EmailLog sheet."""
+        try:
+            sheet = self._get_or_create_email_log_sheet()
+            if not sheet:
+                return
+
+            all_data = sheet.get_all_values()
+            coach_email_lower = coach_email.lower().strip()
+
+            for row_idx, row in enumerate(all_data[1:], start=2):
+                if len(row) > 0 and row[0].lower().strip() == coach_email_lower:
+                    # Update responded column
+                    sheet.update_cell(row_idx, 9, 'yes')  # Column I = responded
+                    sheet.update_cell(row_idx, 10, response_date)  # Column J = response_date
+                    logger.info(f"Marked {coach_email} as responded in EmailLog")
+                    break
+        except Exception as e:
+            logger.error(f"Error marking responded: {e}")
     
     def has_responded(self, coach_email: str) -> bool:
         """Check if a coach has responded."""

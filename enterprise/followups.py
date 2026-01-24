@@ -4,14 +4,21 @@ Smart Follow-Up System
 Automatically creates and manages follow-up reminders after emails are sent.
 Tracks response status and suggests when to follow up.
 
+Default cycle (every 3 days):
+- Day 0: Intro email
+- Day 3: 1st follow-up
+- Day 6: 2nd follow-up
+- Day 9: Restart (send intro again)
+
 Features:
-- Auto-create follow-ups after email sent (7, 14, 21 days)
+- Auto-create follow-ups after email sent
+- Automatic cycle restart after follow-ups complete
 - Track response status
 - Configurable intervals
 - Integration with CRM and reminders system
 
-Author: Coach Outreach System  
-Version: 1.0.0
+Author: Coach Outreach System
+Version: 1.1.0
 ============================================================================
 """
 
@@ -80,10 +87,11 @@ class FollowUp:
     coach_name: str
     coach_email: str
     school: str
-    follow_up_number: int  # 1, 2, or 3
+    follow_up_number: int  # 1, 2, or 'restart' (0 = restart/intro)
     due_date: str  # ISO format
     status: str = "scheduled"
     sent_at: Optional[str] = None
+    is_restart: bool = False  # True if this is a cycle restart (send intro again)
     
     @property
     def is_due(self) -> bool:
@@ -114,6 +122,9 @@ class FollowUp:
         data.pop('is_due', None)
         data.pop('is_overdue', None)
         data.pop('days_until_due', None)
+        # Handle old data without is_restart field
+        if 'is_restart' not in data:
+            data['is_restart'] = False
         return cls(**data)
 
 
@@ -121,8 +132,10 @@ class FollowUp:
 class FollowUpConfig:
     """Configuration for follow-up system"""
     enabled: bool = True
-    intervals_days: List[int] = field(default_factory=lambda: [3, 7, 14])
-    max_followups: int = 3
+    intervals_days: List[int] = field(default_factory=lambda: [3, 6])  # 3 days after intro, then 3 more days
+    max_followups: int = 2  # 2 follow-ups before restart
+    restart_cycle: bool = True  # After follow-ups, restart with intro
+    restart_delay_days: int = 3  # Days after last follow-up to restart
     auto_cancel_on_response: bool = True
     
     def to_dict(self) -> dict:
@@ -241,15 +254,24 @@ class FollowUpManager:
         return record
     
     def _schedule_followups(self, email_record: EmailRecord):
-        """Schedule follow-up reminders for an email"""
+        """
+        Schedule follow-up reminders for an email.
+
+        Default cycle (every 3 days):
+        - Day 0: Intro email (already sent)
+        - Day 3: 1st follow-up
+        - Day 6: 2nd follow-up
+        - Day 9: Restart (send intro again)
+        """
         import uuid
-        
+
         sent_date = datetime.fromisoformat(email_record.sent_at)
-        
+
+        # Schedule follow-ups at intervals (default: day 3 and day 6)
         for i, days in enumerate(self.config.intervals_days[:self.config.max_followups]):
             followup_id = str(uuid.uuid4())[:8]
             due_date = sent_date + timedelta(days=days)
-            
+
             followup = FollowUp(
                 id=followup_id,
                 email_record_id=email_record.id,
@@ -257,13 +279,36 @@ class FollowUpManager:
                 coach_email=email_record.coach_email,
                 school=email_record.school,
                 follow_up_number=i + 1,
-                due_date=due_date.isoformat()
+                due_date=due_date.isoformat(),
+                is_restart=False
             )
-            
+
             self.followups[followup_id] = followup
-        
+
+        # Schedule restart (send intro again) if enabled
+        if self.config.restart_cycle:
+            restart_id = str(uuid.uuid4())[:8]
+            # Restart happens after last follow-up + restart_delay_days
+            last_followup_day = self.config.intervals_days[-1] if self.config.intervals_days else 0
+            restart_day = last_followup_day + self.config.restart_delay_days
+            restart_date = sent_date + timedelta(days=restart_day)
+
+            restart_followup = FollowUp(
+                id=restart_id,
+                email_record_id=email_record.id,
+                coach_name=email_record.coach_name,
+                coach_email=email_record.coach_email,
+                school=email_record.school,
+                follow_up_number=0,  # 0 indicates restart
+                due_date=restart_date.isoformat(),
+                is_restart=True
+            )
+
+            self.followups[restart_id] = restart_followup
+
         self._save_followups()
-        logger.info(f"Scheduled {len(self.config.intervals_days)} follow-ups for {email_record.coach_name}")
+        scheduled_count = len(self.config.intervals_days) + (1 if self.config.restart_cycle else 0)
+        logger.info(f"Scheduled {scheduled_count} follow-ups for {email_record.coach_name} (includes restart)")
     
     def mark_response_received(self, email_id: str, 
                                status: str = "responded",
@@ -330,6 +375,14 @@ class FollowUpManager:
     def get_overdue_followups(self) -> List[FollowUp]:
         """Get overdue follow-ups only"""
         return [f for f in self.get_due_followups() if f.is_overdue]
+
+    def get_due_restarts(self) -> List[FollowUp]:
+        """Get all restarts that are due (should send intro email again)"""
+        return [f for f in self.get_due_followups() if f.is_restart]
+
+    def get_due_regular_followups(self) -> List[FollowUp]:
+        """Get due follow-ups that are NOT restarts"""
+        return [f for f in self.get_due_followups() if not f.is_restart]
     
     def get_upcoming_followups(self, days: int = 7) -> List[FollowUp]:
         """Get follow-ups due in the next N days"""

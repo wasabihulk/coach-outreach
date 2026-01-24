@@ -242,35 +242,66 @@ def get_gmail_service():
         return None
 
 
-def send_email_gmail_api(to_email: str, subject: str, body: str, from_email: str = None) -> bool:
-    """Send email using Gmail API (works on Railway)."""
+def send_email_gmail_api(to_email: str, subject: str, body: str, from_email: str = None,
+                         tracking_id: str = None) -> bool:
+    """Send email using Gmail API (works on Railway). Includes tracking pixel if tracking_id provided."""
     service = get_gmail_service()
     if not service:
         logger.error("Gmail API not configured")
         return False
-    
+
     try:
         from_email = from_email or ENV_EMAIL_ADDRESS
-        
+
         # Create message
-        message = MIMEMultipart()
+        message = MIMEMultipart('alternative')
         message['to'] = to_email
         message['from'] = from_email
         message['subject'] = subject
+
+        # Plain text version
         message.attach(MIMEText(body, 'plain'))
-        
+
+        # HTML version with tracking pixel
+        if tracking_id:
+            # Get the app URL from environment or use default
+            app_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+            if app_url and not app_url.startswith('http'):
+                app_url = f"https://{app_url}"
+
+            # If no Railway URL, try to construct one
+            if not app_url:
+                app_url = os.environ.get('APP_URL', '')
+
+            if app_url:
+                tracking_url = f"{app_url}/track/{tracking_id}.gif"
+                html_body = body.replace('\n', '<br>\n')
+                html_body = f"""<html>
+<body>
+{html_body}
+<img src="{tracking_url}" width="1" height="1" style="display:none;" alt="" />
+</body>
+</html>"""
+                message.attach(MIMEText(html_body, 'html'))
+                logger.info(f"Added tracking pixel: {tracking_url}")
+        else:
+            # No tracking, just add HTML version without pixel
+            html_body = body.replace('\n', '<br>\n')
+            html_body = f"<html><body>{html_body}</body></html>"
+            message.attach(MIMEText(html_body, 'html'))
+
         # Encode in base64
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        
+
         # Send via Gmail API
         result = service.users().messages().send(
             userId='me',
             body={'raw': raw}
         ).execute()
-        
+
         logger.info(f"Email sent via Gmail API to {to_email}, ID: {result.get('id')}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Gmail API send error: {e}")
         import traceback
@@ -2905,20 +2936,212 @@ def api_analytics():
 def api_record_response():
     try:
         from outreach.email_sender import get_analytics
-        
+
         data = request.get_json()
         school = data.get('school', '')
         response_type = data.get('type', 'response')
-        
+
         analytics = get_analytics()
-        
+
         if response_type == 'offer':
             analytics.record_offer(school)
         else:
             analytics.record_response(school)
-        
+
         add_log(f"Recorded {response_type} from {school}", 'success')
         return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+# ============================================================================
+# HUDL VIEW TRACKING
+# ============================================================================
+
+@app.route('/api/hudl/views')
+def api_hudl_views():
+    """Get Hudl view count by scraping the page."""
+    try:
+        current_settings = load_settings()
+        hudl_url = current_settings.get('athlete', {}).get('highlight_url', ENV_HUDL_LINK)
+
+        if not hudl_url or 'hudl.com' not in hudl_url.lower():
+            return jsonify({'success': False, 'error': 'No valid Hudl URL configured', 'views': 0})
+
+        views = scrape_hudl_views(hudl_url)
+
+        # Save to Google Sheets for tracking over time
+        if views is not None:
+            save_hudl_views_to_sheets(views)
+
+        # Get historical data from sheets
+        history = get_hudl_views_history()
+
+        return jsonify({
+            'success': True,
+            'current_views': views,
+            'hudl_url': hudl_url,
+            'history': history
+        })
+    except Exception as e:
+        logger.error(f"Hudl views error: {e}")
+        return jsonify({'success': False, 'error': str(e), 'views': 0})
+
+
+def scrape_hudl_views(hudl_url: str) -> int:
+    """Scrape Hudl page to get view count."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+
+        response = requests.get(hudl_url, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Look for view count in various places Hudl might put it
+        # Method 1: Look for views in meta tags or JSON-LD
+        import re
+        import json
+
+        # Try to find JSON-LD data
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    if 'interactionStatistic' in data:
+                        for stat in data['interactionStatistic']:
+                            if stat.get('interactionType', {}).get('@type') == 'WatchAction':
+                                return int(stat.get('userInteractionCount', 0))
+            except:
+                pass
+
+        # Method 2: Look for view count in page text
+        text = soup.get_text()
+
+        # Pattern: "X views" or "X Views"
+        view_patterns = [
+            r'(\d{1,3}(?:,\d{3})*)\s*(?:views?|Views?)',
+            r'Views?\s*[:\-]?\s*(\d{1,3}(?:,\d{3})*)',
+            r'"viewCount"[:\s]*["\']?(\d+)',
+            r'view-count["\s:>]*(\d+)',
+        ]
+
+        for pattern in view_patterns:
+            match = re.search(pattern, text)
+            if match:
+                views_str = match.group(1).replace(',', '')
+                return int(views_str)
+
+        # Method 3: Look for specific elements
+        view_elements = soup.find_all(['span', 'div'], class_=re.compile(r'view|stat|count', re.I))
+        for elem in view_elements:
+            text = elem.get_text()
+            match = re.search(r'(\d{1,3}(?:,\d{3})*)', text)
+            if match:
+                views_str = match.group(1).replace(',', '')
+                views = int(views_str)
+                if views > 0:
+                    return views
+
+        logger.warning("Could not find view count on Hudl page")
+        return None
+
+    except Exception as e:
+        logger.error(f"Error scraping Hudl: {e}")
+        return None
+
+
+def save_hudl_views_to_sheets(views: int):
+    """Save Hudl view count to Google Sheets for historical tracking."""
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            return
+
+        spreadsheet = sheet.spreadsheet
+
+        # Get or create HudlViews worksheet
+        try:
+            views_sheet = spreadsheet.worksheet('HudlViews')
+        except:
+            views_sheet = spreadsheet.add_worksheet(title='HudlViews', rows=500, cols=3)
+            views_sheet.update('A1:C1', [['Date', 'Time', 'Views']])
+
+        # Add new row with current view count
+        from datetime import datetime
+        now = datetime.now()
+        views_sheet.append_row([
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M'),
+            views
+        ])
+
+        logger.info(f"Saved Hudl views to sheet: {views}")
+    except Exception as e:
+        logger.error(f"Error saving Hudl views to sheet: {e}")
+
+
+def get_hudl_views_history() -> list:
+    """Get Hudl view history from Google Sheets."""
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            return []
+
+        spreadsheet = sheet.spreadsheet
+
+        try:
+            views_sheet = spreadsheet.worksheet('HudlViews')
+        except:
+            return []
+
+        all_data = views_sheet.get_all_values()
+        if len(all_data) < 2:
+            return []
+
+        # Return last 30 entries
+        history = []
+        for row in all_data[-30:]:
+            if len(row) >= 3:
+                history.append({
+                    'date': row[0],
+                    'time': row[1],
+                    'views': int(row[2]) if row[2].isdigit() else 0
+                })
+
+        return history
+    except Exception as e:
+        logger.error(f"Error getting Hudl history: {e}")
+        return []
+
+
+@app.route('/api/hudl/check')
+def api_hudl_check():
+    """Check Hudl views and send notification if increased."""
+    try:
+        result = api_hudl_views().get_json()
+
+        if result.get('success') and result.get('history'):
+            history = result['history']
+            if len(history) >= 2:
+                current = history[-1]['views']
+                previous = history[-2]['views']
+
+                if current > previous:
+                    increase = current - previous
+                    current_settings = load_settings()
+                    if current_settings.get('notifications', {}).get('enabled'):
+                        send_phone_notification(
+                            title="Hudl Views Increased!",
+                            message=f"Your highlight video has {current} views (+{increase} new)"
+                        )
+
+        return result
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -3627,6 +3850,125 @@ def api_check_responses():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'success': False, 'error': str(e)})
+
+
+# ============================================================================
+# EMAIL OPEN TRACKING VIA PIXEL
+# ============================================================================
+
+# 1x1 transparent GIF
+TRACKING_PIXEL = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x01D\x00;'
+
+
+@app.route('/track/<tracking_id>.gif')
+def track_email_open(tracking_id):
+    """Track when an email is opened via tracking pixel."""
+    try:
+        # Parse tracking ID: format is "school_coachtype_timestamp" encoded in base64
+        import base64
+        try:
+            decoded = base64.urlsafe_b64decode(tracking_id + '==').decode('utf-8')
+            parts = decoded.split('|')
+            if len(parts) >= 3:
+                school = parts[0]
+                coach_type = parts[1]
+                coach_email = parts[2] if len(parts) > 2 else ''
+
+                logger.info(f"EMAIL OPENED: {school} ({coach_type}) - {coach_email}")
+
+                # Record in Google Sheet
+                sheet = get_sheet()
+                if sheet:
+                    record_email_open_in_sheet(sheet, school, coach_type, coach_email)
+
+                # Send notification
+                current_settings = load_settings()
+                if current_settings.get('notifications', {}).get('enabled'):
+                    send_phone_notification(
+                        title="Email Opened!",
+                        message=f"Coach at {school} ({coach_type}) opened your email!"
+                    )
+        except Exception as e:
+            logger.warning(f"Could not parse tracking ID: {e}")
+
+    except Exception as e:
+        logger.error(f"Tracking error: {e}")
+
+    # Always return the pixel image
+    return Response(TRACKING_PIXEL, mimetype='image/gif')
+
+
+def record_email_open_in_sheet(sheet, school: str, coach_type: str, coach_email: str):
+    """Record an email open event in the Google Sheet."""
+    try:
+        all_data = sheet.get_all_values()
+        if len(all_data) < 2:
+            return
+
+        headers = [h.lower().strip() for h in all_data[0]]
+
+        def find_col(keywords):
+            for i, h in enumerate(headers):
+                for kw in keywords:
+                    if kw in h:
+                        return i
+            return -1
+
+        school_col = find_col(['school'])
+        rc_email_status_col = find_col(['rc email status'])
+        ol_email_status_col = find_col(['ol email status'])
+        rc_notes_col = find_col(['rc notes'])
+        ol_notes_col = find_col(['ol notes'])
+
+        school_lower = school.lower().strip()
+
+        for row_idx, row in enumerate(all_data[1:], start=2):
+            row_school = row[school_col].strip().lower() if school_col >= 0 and school_col < len(row) else ''
+
+            if row_school == school_lower:
+                from datetime import datetime
+                now = datetime.now().strftime('%m/%d %H:%M')
+
+                if coach_type == 'rc':
+                    # Update RC Email Status
+                    if rc_email_status_col >= 0:
+                        current = row[rc_email_status_col] if rc_email_status_col < len(row) else ''
+                        if 'opened' not in current.lower():
+                            sheet.update_cell(row_idx, rc_email_status_col + 1, f'Opened {now}')
+                    # Update RC Notes
+                    if rc_notes_col >= 0:
+                        current = row[rc_notes_col] if rc_notes_col < len(row) else ''
+                        new_note = f"OPENED {now}"
+                        if new_note.lower() not in current.lower():
+                            updated = f"{new_note}; {current}" if current else new_note
+                            sheet.update_cell(row_idx, rc_notes_col + 1, updated)
+                else:
+                    # Update OL Email Status
+                    if ol_email_status_col >= 0:
+                        current = row[ol_email_status_col] if ol_email_status_col < len(row) else ''
+                        if 'opened' not in current.lower():
+                            sheet.update_cell(row_idx, ol_email_status_col + 1, f'Opened {now}')
+                    # Update OL Notes
+                    if ol_notes_col >= 0:
+                        current = row[ol_notes_col] if ol_notes_col < len(row) else ''
+                        new_note = f"OPENED {now}"
+                        if new_note.lower() not in current.lower():
+                            updated = f"{new_note}; {current}" if current else new_note
+                            sheet.update_cell(row_idx, ol_notes_col + 1, updated)
+
+                logger.info(f"Recorded email open for {school} ({coach_type})")
+                break
+
+    except Exception as e:
+        logger.error(f"Error recording email open: {e}")
+
+
+def generate_tracking_id(school: str, coach_type: str, coach_email: str) -> str:
+    """Generate a tracking ID for email open tracking."""
+    import base64
+    data = f"{school}|{coach_type}|{coach_email}"
+    encoded = base64.urlsafe_b64encode(data.encode('utf-8')).decode('utf-8').rstrip('=')
+    return encoded
 
 
 @app.route('/api/email/test-tracking')
@@ -4449,33 +4791,38 @@ def api_email_send():
     """Send emails to coaches from sheet - handles intro and follow-up campaigns."""
     # Reload settings fresh to avoid stale/corrupted data
     current_settings = load_settings()
-    
+
     data = request.get_json() or {}
     limit = data.get('limit', 10)
     template_id = data.get('template_id')
     campaign_type = data.get('campaign_type', 'intro')  # 'intro', 'followup_1', 'followup_2', 'smart'
-    
+
+    # Get athlete email to prevent self-emailing
+    athlete_email = current_settings.get('athlete', {}).get('email', '').lower().strip()
+    if not athlete_email:
+        athlete_email = ENV_ATHLETE_EMAIL.lower().strip()
+
     try:
         sheet = get_sheet()
         if not sheet:
             return jsonify({'success': False, 'error': 'Sheet not connected', 'sent': 0, 'errors': 0})
-        
+
         all_data = sheet.get_all_values()
         if not all_data:
             return jsonify({'success': False, 'error': 'No data in sheet', 'sent': 0, 'errors': 0})
-        
+
         headers = [h.lower().strip() for h in all_data[0]]
         rows = all_data[1:]
-        
+
         logger.info(f"Sheet headers: {headers}")
-        
+
         def find_col(keywords):
             for i, h in enumerate(headers):
                 for kw in keywords:
                     if kw in h:
                         return i
             return -1
-        
+
         # Match YOUR actual column names from "bardeen" sheet
         school_col = find_col(['school'])
         rc_name_col = find_col(['recruiting coordinator'])
@@ -4486,7 +4833,15 @@ def api_email_send():
         ol_email_col = find_col(['oc email'])
         ol_contacted_col = find_col(['ol contacted'])
         ol_notes_col = find_col(['ol notes'])
-        
+
+        # NEW: Additional tracking columns
+        rc_stage_col = find_col(['rc stage'])
+        ol_stage_col = find_col(['ol stage'])
+        rc_responded_col = find_col(['rc responded'])
+        ol_responded_col = find_col(['ol responded'])
+        rc_email_status_col = find_col(['rc email status'])
+        ol_email_status_col = find_col(['ol email status'])
+
         logger.info(f"Columns: school={school_col}, rc_email={rc_email_col}, ol_email={ol_email_col}")
         
         if school_col == -1:
@@ -4577,15 +4932,30 @@ def api_email_send():
                 rc_contacted = row[rc_contacted_col].strip() if rc_contacted_col >= 0 and rc_contacted_col < len(row) else ''
                 rc_notes = row[rc_notes_col].strip() if rc_notes_col >= 0 and rc_notes_col < len(row) else ''
                 rc_name = row[rc_name_col] if rc_name_col >= 0 and rc_name_col < len(row) else 'Coach'
-                
+                rc_responded = row[rc_responded_col].strip() if rc_responded_col >= 0 and rc_responded_col < len(row) else ''
+                rc_email_status = row[rc_email_status_col].strip().lower() if rc_email_status_col >= 0 and rc_email_status_col < len(row) else ''
+
                 if rc_email and '@' in rc_email:
+                    # SKIP: athlete's own email (prevent self-emailing)
+                    if rc_email.lower().strip() == athlete_email:
+                        logger.warning(f"Skipping athlete's own email: {rc_email}")
+                        continue
+
+                    # SKIP: if RC Responded column has any value
+                    if rc_responded:
+                        continue
+
+                    # SKIP: if email status is 'wrong' or 'blocked'
+                    if rc_email_status in ['wrong', 'blocked', 'invalid']:
+                        continue
+
                     stage = get_email_stage(rc_contacted, rc_notes)
                     days = days_since_contact(rc_contacted)
-                    
+
                     # Determine what email to send
                     should_send = False
                     email_type = None
-                    
+
                     if stage == 'replied':
                         pass  # Skip - they replied
                     elif stage == 'new':
@@ -4605,27 +4975,44 @@ def api_email_send():
                     if should_send:
                         coaches.append({
                             'email': rc_email, 'name': rc_name, 'school': school, 'type': 'rc',
-                            'row_idx': row_idx + 2, 
+                            'row_idx': row_idx + 2,
                             'contacted_col': rc_contacted_col + 1 if rc_contacted_col >= 0 else None,
                             'notes_col': rc_notes_col + 1 if rc_notes_col >= 0 else None,
+                            'stage_col': rc_stage_col + 1 if rc_stage_col >= 0 else None,
+                            'email_status_col': rc_email_status_col + 1 if rc_email_status_col >= 0 else None,
                             'email_type': email_type, 'current_notes': rc_notes,
                             'days_since': days  # Track days since last contact for sorting
                         })
-            
+
             # Check OL/OC
             if ol_email_col >= 0 and ol_email_col < len(row):
                 ol_email = row[ol_email_col].strip()
                 ol_contacted = row[ol_contacted_col].strip() if ol_contacted_col >= 0 and ol_contacted_col < len(row) else ''
                 ol_notes = row[ol_notes_col].strip() if ol_notes_col >= 0 and ol_notes_col < len(row) else ''
                 ol_name = row[ol_name_col] if ol_name_col >= 0 and ol_name_col < len(row) else 'Coach'
-                
+                ol_responded = row[ol_responded_col].strip() if ol_responded_col >= 0 and ol_responded_col < len(row) else ''
+                ol_email_status = row[ol_email_status_col].strip().lower() if ol_email_status_col >= 0 and ol_email_status_col < len(row) else ''
+
                 if ol_email and '@' in ol_email:
+                    # SKIP: athlete's own email (prevent self-emailing)
+                    if ol_email.lower().strip() == athlete_email:
+                        logger.warning(f"Skipping athlete's own email: {ol_email}")
+                        continue
+
+                    # SKIP: if OL Responded column has any value
+                    if ol_responded:
+                        continue
+
+                    # SKIP: if email status is 'wrong' or 'blocked'
+                    if ol_email_status in ['wrong', 'blocked', 'invalid']:
+                        continue
+
                     stage = get_email_stage(ol_contacted, ol_notes)
                     days = days_since_contact(ol_contacted)
-                    
+
                     should_send = False
                     email_type = None
-                    
+
                     if stage == 'replied':
                         pass
                     elif stage == 'new':
@@ -4648,6 +5035,8 @@ def api_email_send():
                             'row_idx': row_idx + 2,
                             'contacted_col': ol_contacted_col + 1 if ol_contacted_col >= 0 else None,
                             'notes_col': ol_notes_col + 1 if ol_notes_col >= 0 else None,
+                            'stage_col': ol_stage_col + 1 if ol_stage_col >= 0 else None,
+                            'email_status_col': ol_email_status_col + 1 if ol_email_status_col >= 0 else None,
                             'email_type': email_type, 'current_notes': ol_notes,
                             'days_since': days  # Track days since last contact for sorting
                         })
@@ -4735,9 +5124,12 @@ def api_email_send():
 
                 logger.info(f"Attempting to send to: {coach_email} at {coach['school']}")
 
+                # Generate tracking ID for open tracking
+                tracking_id = generate_tracking_id(coach['school'], coach['type'], coach_email)
+
                 # Send email
                 if use_gmail_api:
-                    success = send_email_gmail_api(coach_email, subject, body, email_addr)
+                    success = send_email_gmail_api(coach_email, subject, body, email_addr, tracking_id=tracking_id)
                 else:
                     msg = MIMEMultipart()
                     msg['From'] = email_addr
@@ -4749,7 +5141,7 @@ def api_email_send():
                 
                 if success:
                     sent += 1
-                    
+
                     # Track counts
                     if email_type == 'followup_1':
                         followup1_count += 1
@@ -4757,19 +5149,34 @@ def api_email_send():
                         followup2_count += 1
                     else:
                         intro_count += 1
-                    
+
                     response_tracker.record_sent(
                         coach_email=coach_email, coach_name=coach['name'],
                         school=coach['school'], division='',
                         coach_type=coach['type'], template_id=template.id
                     )
-                    
-                    # Update sheet
+
+                    # Update sheet - Contacted column
                     if coach.get('contacted_col'):
                         try:
-                            sheet.update_cell(coach['row_idx'], coach['contacted_col'], today.strftime('%m/%d/%Y'))
-                        except: pass
-                    
+                            sheet.update_cell(coach['row_idx'], coach['contacted_col'], today.strftime('%Y-%m-%d'))
+                        except Exception as e:
+                            logger.warning(f"Failed to update contacted col: {e}")
+
+                    # Update sheet - Stage column (tracks email sequence)
+                    if coach.get('stage_col'):
+                        try:
+                            if email_type == 'followup_1':
+                                stage_value = 'Follow-up 1'
+                            elif email_type == 'followup_2':
+                                stage_value = 'Follow-up 2'
+                            else:
+                                stage_value = 'Intro Sent'
+                            sheet.update_cell(coach['row_idx'], coach['stage_col'], stage_value)
+                        except Exception as e:
+                            logger.warning(f"Failed to update stage col: {e}")
+
+                    # Update sheet - Notes column
                     if coach.get('notes_col'):
                         try:
                             current_notes = coach.get('current_notes', '')
@@ -4779,12 +5186,20 @@ def api_email_send():
                                 new_note = f"Follow-up 2 sent {today.strftime('%m/%d')}"
                             else:
                                 new_note = f"Intro sent {today.strftime('%m/%d')}"
-                            
+
                             # Don't add duplicate notes
                             if new_note.lower() not in current_notes.lower():
                                 updated_notes = f"{new_note}; {current_notes}" if current_notes else new_note
                                 sheet.update_cell(coach['row_idx'], coach['notes_col'], updated_notes)
-                        except: pass
+                        except Exception as e:
+                            logger.warning(f"Failed to update notes col: {e}")
+
+                    # Update Email Status column to show it's been sent
+                    if coach.get('email_status_col'):
+                        try:
+                            sheet.update_cell(coach['row_idx'], coach['email_status_col'], 'sent')
+                        except Exception as e:
+                            logger.warning(f"Failed to update email status col: {e}")
                 else:
                     errors += 1
                 
@@ -4810,19 +5225,65 @@ def api_email_send():
 
 @app.route('/api/twitter/mark-dm-sent', methods=['POST'])
 def api_twitter_mark_dm_sent():
-    """Mark a DM as sent."""
+    """Mark a DM as sent - updates Google Sheet Twitter Status column."""
     data = request.get_json()
     try:
-        dm_file = CONFIG_DIR / 'dm_sent.json'
-        sent = {}
-        if dm_file.exists():
-            with open(dm_file) as f:
-                sent = json.load(f)
-        sent[f"{data.get('school')}:{data.get('email')}"] = datetime.now().isoformat()
-        with open(dm_file, 'w') as f:
-            json.dump(sent, f)
+        school = data.get('school', '')
+        coach_type = data.get('coach_type', 'rc')  # 'rc' or 'ol'
+
+        # Update Google Sheet instead of local file
+        sheet = get_sheet()
+        if not sheet:
+            return jsonify({'success': False, 'error': 'Sheet not connected'})
+
+        all_data = sheet.get_all_values()
+        headers = [h.lower().strip() for h in all_data[0]]
+
+        def find_col(keywords):
+            for i, h in enumerate(headers):
+                for kw in keywords:
+                    if kw in h:
+                        return i
+            return -1
+
+        school_col = find_col(['school'])
+        rc_twitter_status_col = find_col(['rc twitter status'])
+        ol_twitter_status_col = find_col(['ol twitter status'])
+        rc_notes_col = find_col(['rc notes'])
+        ol_notes_col = find_col(['ol notes'])
+
+        school_lower = school.lower().strip()
+
+        for row_idx, row in enumerate(all_data[1:], start=2):
+            row_school = row[school_col].strip().lower() if school_col >= 0 and school_col < len(row) else ''
+            if row_school == school_lower:
+                now = datetime.now().strftime('%m/%d')
+
+                if coach_type == 'rc':
+                    if rc_twitter_status_col >= 0:
+                        sheet.update_cell(row_idx, rc_twitter_status_col + 1, 'messaged')
+                    if rc_notes_col >= 0:
+                        current = row[rc_notes_col] if rc_notes_col < len(row) else ''
+                        note = f"DM sent {now}"
+                        if note.lower() not in current.lower():
+                            updated = f"{note}; {current}" if current else note
+                            sheet.update_cell(row_idx, rc_notes_col + 1, updated)
+                else:
+                    if ol_twitter_status_col >= 0:
+                        sheet.update_cell(row_idx, ol_twitter_status_col + 1, 'messaged')
+                    if ol_notes_col >= 0:
+                        current = row[ol_notes_col] if ol_notes_col < len(row) else ''
+                        note = f"DM sent {now}"
+                        if note.lower() not in current.lower():
+                            updated = f"{note}; {current}" if current else note
+                            sheet.update_cell(row_idx, ol_notes_col + 1, updated)
+
+                logger.info(f"Marked DM sent for {school} ({coach_type})")
+                break
+
         return jsonify({'success': True})
     except Exception as e:
+        logger.error(f"Error marking DM sent: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
 
@@ -5544,18 +6005,87 @@ def check_responses_background():
         logger.error(f"Background response check error: {e}")
 
 
+def get_last_send_date_from_sheet():
+    """Get the last send date from Google Sheet Settings tab to persist across Railway restarts."""
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            return None
+        # Try to get the Settings worksheet
+        try:
+            spreadsheet = sheet.spreadsheet
+            try:
+                settings_sheet = spreadsheet.worksheet('Settings')
+            except:
+                # Create Settings sheet if it doesn't exist
+                settings_sheet = spreadsheet.add_worksheet(title='Settings', rows=10, cols=2)
+                settings_sheet.update('A1:B1', [['Key', 'Value']])
+                settings_sheet.update('A2:B2', [['last_send_date', '']])
+                settings_sheet.update('A3:B3', [['template_rotation_rc', '0']])
+                settings_sheet.update('A4:B4', [['template_rotation_ol', '0']])
+                return None
+
+            # Find last_send_date row
+            all_data = settings_sheet.get_all_values()
+            for row in all_data[1:]:
+                if len(row) >= 2 and row[0] == 'last_send_date':
+                    if row[1]:
+                        return datetime.strptime(row[1], '%Y-%m-%d').date()
+        except Exception as e:
+            logger.warning(f"Could not get last_send_date from sheet: {e}")
+    except Exception as e:
+        logger.error(f"Error getting last_send_date: {e}")
+    return None
+
+
+def set_last_send_date_in_sheet(send_date):
+    """Persist the last send date to Google Sheet to prevent double-sending on Railway restart."""
+    try:
+        sheet = get_sheet()
+        if not sheet:
+            return False
+        spreadsheet = sheet.spreadsheet
+        try:
+            settings_sheet = spreadsheet.worksheet('Settings')
+        except:
+            settings_sheet = spreadsheet.add_worksheet(title='Settings', rows=10, cols=2)
+            settings_sheet.update('A1:B1', [['Key', 'Value']])
+            settings_sheet.update('A2:B2', [['last_send_date', '']])
+            settings_sheet.update('A3:B3', [['template_rotation_rc', '0']])
+            settings_sheet.update('A4:B4', [['template_rotation_ol', '0']])
+
+        # Find and update last_send_date row
+        all_data = settings_sheet.get_all_values()
+        for i, row in enumerate(all_data):
+            if len(row) >= 1 and row[0] == 'last_send_date':
+                settings_sheet.update_cell(i + 1, 2, send_date.strftime('%Y-%m-%d'))
+                logger.info(f"Persisted last_send_date to sheet: {send_date}")
+                return True
+
+        # If not found, add it
+        settings_sheet.append_row(['last_send_date', send_date.strftime('%Y-%m-%d')])
+        logger.info(f"Added last_send_date to sheet: {send_date}")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting last_send_date: {e}")
+        return False
+
+
 def start_auto_send_scheduler():
     """Start the background scheduler for auto-sending and reminders with random timing."""
     def scheduler_loop():
-        last_send_date = None
+        # CRITICAL: Load last_send_date from Google Sheets to persist across Railway restarts
+        last_send_date = get_last_send_date_from_sheet()
+        if last_send_date:
+            logger.info(f"Loaded last_send_date from sheet: {last_send_date}")
         last_reminder_date = None
         last_response_check = None
-        
+
         # Random hour between 8am and 6pm for sending
         send_hour = random.randint(8, 18)
         send_minute = random.randint(0, 59)
         logger.info(f"Today's auto-send scheduled for {send_hour}:{send_minute:02d}")
-        
+
         while True:
             try:
                 current_settings = load_settings()
@@ -5563,13 +6093,13 @@ def start_auto_send_scheduler():
                 current_hour = datetime.now().hour
                 current_minute = datetime.now().minute
                 now = datetime.now()
-                
+
                 # Pick new random time each day
                 if last_send_date != today:
                     send_hour = random.randint(8, 18)
                     send_minute = random.randint(0, 59)
                     logger.info(f"New day - auto-send scheduled for {send_hour}:{send_minute:02d}")
-                
+
                 # Auto-send at the random time if enabled
                 if current_settings.get('email', {}).get('auto_send_enabled', False):
                     if last_send_date != today:
@@ -5577,14 +6107,16 @@ def start_auto_send_scheduler():
                             logger.info(f"Auto-send triggered at {current_hour}:{current_minute:02d}")
                             auto_send_emails()
                             last_send_date = today
-                
+                            # CRITICAL: Persist to Google Sheets to prevent double-sending
+                            set_last_send_date_in_sheet(today)
+
                 # Send daily reminder at random morning time (8-10am) if auto-send is OFF
                 reminder_hour = 9  # Could also randomize this
                 if current_hour >= reminder_hour and last_reminder_date != today:
                     if not current_settings.get('email', {}).get('auto_send_enabled', False):
                         send_daily_reminder()
                     last_reminder_date = today
-                
+
                 # Check for responses every hour
                 if last_response_check is None or (now - last_response_check).seconds >= 3600:
                     if has_gmail_api():
@@ -5594,13 +6126,13 @@ def start_auto_send_scheduler():
                         except Exception as e:
                             logger.error(f"Response check error: {e}")
                     last_response_check = now
-                    
+
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
-            
+
             # Check every 15 minutes for more precise timing
             time.sleep(900)
-    
+
     thread = threading.Thread(target=scheduler_loop, daemon=True)
     thread.start()
     logger.info("Auto-send scheduler started (random daily timing enabled)")
